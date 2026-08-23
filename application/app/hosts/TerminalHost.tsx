@@ -240,6 +240,8 @@ export function TerminalHost() {
       toggleScriptsSidePanelRef: handlers.toggleScriptsSidePanelRef,
       toggleSidePanelRef: handlers.toggleSidePanelRef,
       cycleSidePanelToolRef: handlers.cycleSidePanelToolRef,
+      terminalPaneMagnificationRef: handlers.terminalPaneMagnificationRef,
+      sftpPaneMagnificationRef: handlers.sftpPaneMagnificationRef,
       toggleWorkspaceViewMode: sessionActions?.toggleWorkspaceViewMode,
       updateHostDistro: vaultActions?.updateHostDistro,
       updateSplitSizes: sessionActions?.updateSplitSizes,
