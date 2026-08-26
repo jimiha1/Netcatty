@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const Module = require("node:module");
@@ -15,16 +16,11 @@ const {
   waitForTransportDial,
 } = require("./sshConnectionPool.cjs");
 
-// Throwaway ed25519 fixture (generated key pair, no passphrase) — must be
-// real OpenSSH key material because sshAuthHelper validates private material
-// through the real ssh2 parser, which a placeholder string cannot satisfy.
-const TEST_ED25519_PRIVATE_KEY = `-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACAcCppaeIMRjfGNEEAyM1LP3grGU+T41LLvie0NFrrSGgAAAJjHvkHyx75B
-8gAAAAtzc2gtZWQyNTUxOQAAACAcCppaeIMRjfGNEEAyM1LP3grGU+T41LLvie0NFrrSGg
-AAAEDaCMiADCNswUEKD0EpbNvl6nsJ0S6wSZoc2Q/INIdrcRwKmlp4gxGN8Y0QQDIzUs/e
-CsZT5PjUsu+J7Q0WutIaAAAAFW5ldGNhdHR5LXRlc3QtZml4dHVyZQ==
------END OPENSSH PRIVATE KEY-----`;
+const TEST_PRIVATE_KEY = crypto.generateKeyPairSync("ec", {
+  namedCurve: "prime256v1",
+  privateKeyEncoding: { type: "sec1", format: "pem" },
+  publicKeyEncoding: { type: "spki", format: "pem" },
+}).privateKey;
 
 test.beforeEach(() => {
   resetSshTransportRegistryForTests({ defaultIdleTtlMs: 0 });
@@ -590,6 +586,13 @@ function loadBridgeWithAuthRetryMocks(t, options = {}) {
   return { bridge, MockSSHClient };
 }
 
+function createParsedPrivateKey() {
+  return {
+    isPrivateKey: () => true,
+    getPrivatePEM: () => TEST_PRIVATE_KEY,
+  };
+}
+
 test("terminal SSH supports consecutive keyboard-interactive factors (#2150)", async (t) => {
   const { bridge, MockSSHClient } = loadBridgeWithAuthRetryMocks(t, {
     connectEvents: ["repeated-keyboard-interactive"],
@@ -1039,7 +1042,7 @@ test("terminal SSH keeps keyboard-interactive eligible after password rejection"
 test("terminal SSH prefers keyboard-interactive after publickey partial success", async (t) => {
   const { bridge, MockSSHClient } = loadBridgeWithAuthRetryMocks(t, {
     connectEvents: ["publickey-then-password-and-keyboard-interactive"],
-    parseKeyResult: { isPrivateKey: () => true },
+    parseKeyResult: createParsedPrivateKey(),
   });
   const ipcMain = makeIpcMain();
   bridge.init({ sessions: new Map(), electronModule: {} });
@@ -1067,7 +1070,7 @@ test("terminal SSH prefers keyboard-interactive after publickey partial success"
       hostname: "corp-edr.example.com",
       username: "alice",
       authMethod: "key",
-      privateKey: TEST_ED25519_PRIVATE_KEY,
+      privateKey: TEST_PRIVATE_KEY,
       password: "login-password",
       useSshAgent: false,
       port: 22,
@@ -1091,7 +1094,7 @@ test("terminal SSH prefers keyboard-interactive after publickey partial success"
 test("terminal SSH certificate auth prefers keyboard-interactive after agent partial success after partial success", async (t) => {
   const { bridge, MockSSHClient } = loadBridgeWithAuthRetryMocks(t, {
     connectEvents: ["agent-then-password-and-keyboard-interactive"],
-    parseKeyResult: { isPrivateKey: () => true },
+    parseKeyResult: createParsedPrivateKey(),
   });
   const ipcMain = makeIpcMain();
   bridge.init({ sessions: new Map(), electronModule: {} });
@@ -1120,7 +1123,7 @@ test("terminal SSH certificate auth prefers keyboard-interactive after agent par
       username: "alice",
       authMethod: "certificate",
       certificate: "ssh-rsa-cert-v01@openssh.com AAAA test-cert",
-      privateKey: TEST_ED25519_PRIVATE_KEY,
+      privateKey: TEST_PRIVATE_KEY,
       password: "login-password",
       useSshAgent: false,
       port: 22,
@@ -1142,7 +1145,7 @@ test("terminal SSH certificate auth prefers keyboard-interactive after agent par
 test("terminal SSH certificate requiresMfa prefers keyboard-interactive after a rejected certificate", async (t) => {
   const { bridge, MockSSHClient } = loadBridgeWithAuthRetryMocks(t, {
     connectEvents: ["agent-then-mfa-keyboard-interactive-before-password"],
-    parseKeyResult: { isPrivateKey: () => true },
+    parseKeyResult: createParsedPrivateKey(),
   });
   const ipcMain = makeIpcMain();
   bridge.init({ sessions: new Map(), electronModule: {} });
@@ -1158,7 +1161,7 @@ test("terminal SSH certificate requiresMfa prefers keyboard-interactive after a 
       authMethod: "certificate",
       requiresMfa: true,
       certificate: "ssh-rsa-cert-v01@openssh.com AAAA test-cert",
-      privateKey: TEST_ED25519_PRIVATE_KEY,
+      privateKey: TEST_PRIVATE_KEY,
       password: "login-password",
       useSshAgent: false,
       port: 22,
@@ -1183,7 +1186,7 @@ test("terminal SSH certificate auth retries keyboard-interactive when password r
       "agent-password-removes-keyboard-interactive",
       "agent-then-keyboard-interactive-after-skip-password",
     ],
-    parseKeyResult: { isPrivateKey: () => true },
+    parseKeyResult: createParsedPrivateKey(),
   });
   const ipcMain = makeIpcMain();
   bridge.init({ sessions: new Map(), electronModule: {} });
@@ -1212,7 +1215,7 @@ test("terminal SSH certificate auth retries keyboard-interactive when password r
       username: "alice",
       authMethod: "certificate",
       certificate: "ssh-rsa-cert-v01@openssh.com AAAA test-cert",
-      privateKey: TEST_ED25519_PRIVATE_KEY,
+      privateKey: TEST_PRIVATE_KEY,
       password: "login-password",
       useSshAgent: false,
       port: 22,
