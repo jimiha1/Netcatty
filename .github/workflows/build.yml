@@ -724,14 +724,18 @@ jobs:
           # Live signed indexes still select versions and verify every download.
           printf 'http://deb.debian.org/debian-security\tpriority:1\nhttp://security.debian.org/debian-security\tpriority:2\nhttp://snapshot.debian.org/archive/debian-security/20260901T000000Z/\tpriority:3 type:deb\n' > /etc/apt/security-mirrors.txt
           sed -i 's|http://deb.debian.org/debian-security|mirror+file:/etc/apt/security-mirrors.txt|g' /etc/apt/sources.list
-          apt-get -o Acquire::Retries=4 update
-          apt-get -o Acquire::Retries=4 install -y curl build-essential python3 git libfuse2 file rpm \
+          # snapshot.debian.org Release files carry their original Valid-Until,
+          # which passes a few days after the pinned date (bullseye is post-LTS,
+          # so the snapshot fallback is the only source). Accept the expired
+          # Release file — package selection and signing stay verified.
+          apt-get -o Acquire::Retries=4 -o Acquire::Check-Valid-Until=false update
+          apt-get -o Acquire::Retries=4 -o Acquire::Check-Valid-Until=false install -y curl build-essential python3 git libfuse2 file rpm \
             libarchive-tools \
             libglib2.0-0 libgtk-3-0 libnss3 libxss1 libxtst6 libasound2 \
             libatk-bridge2.0-0 libdrm2 libgbm1 libx11-xcb1 libxcb-dri3-0
           curl -fsSL --retry 4 --retry-all-errors --connect-timeout 20 --max-time 300 \
             https://deb.nodesource.com/setup_22.x | bash -
-          apt-get -o Acquire::Retries=4 install -y nodejs
+          apt-get -o Acquire::Retries=4 -o Acquire::Check-Valid-Until=false install -y nodejs
 
       - name: Checkout
         uses: actions/checkout@v7
