@@ -51,6 +51,7 @@ import { CopilotCliCard } from "./ai/CopilotCliCard";
 import { CodebuddyCard } from "./ai/CodebuddyCard";
 import { SafetySettings } from "./ai/SafetySettings";
 import { ExternalMcpCard } from "./ai/ExternalMcpCard";
+import { ToolAccessGuidance } from "./ai/ToolAccessGuidance";
 import { PermissionGrantsSettings } from "./ai/PermissionGrantsSettings";
 import { useAIPermissionGrantsState } from "../../../application/state/useAIPermissionGrantsState";
 import { WebSearchSettings } from "./ai/WebSearchSettings";
@@ -341,12 +342,16 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
   const mountedRef = useRef(true);
   const agentPathRequestIdRef = useRef<Partial<Record<ManagedAgentKey, number>>>({});
   const codexRequestIdRef = useRef(0);
-  useEffect(() => () => {
-    mountedRef.current = false;
-    codexRequestIdRef.current += 1;
-    for (const key of ["codex", "claude", "copilot", "cursor", "codebuddy", "opencode", "grok"] as ManagedAgentKey[]) {
-      agentPathRequestIdRef.current[key] = (agentPathRequestIdRef.current[key] ?? 0) + 1;
-    }
+  useEffect(() => {
+    mountedRef.current = true;
+    const agentPathRequestIds = agentPathRequestIdRef.current;
+    return () => {
+      mountedRef.current = false;
+      codexRequestIdRef.current += 1;
+      for (const key of ["codex", "claude", "copilot", "cursor", "codebuddy", "opencode", "grok"] as ManagedAgentKey[]) {
+        agentPathRequestIds[key] = (agentPathRequestIds[key] ?? 0) + 1;
+      }
+    };
   }, []);
 
   const applyResolvedAgentPath = useCallback((
@@ -1252,6 +1257,9 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
                   className="w-48"
                 />
               </SettingRow>
+              <div className="pb-4">
+                <ToolAccessGuidance mode={toolIntegrationMode} />
+              </div>
             </SettingCard>
           </SettingsSection>
 

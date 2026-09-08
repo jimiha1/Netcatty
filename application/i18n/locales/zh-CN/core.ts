@@ -194,6 +194,12 @@ export const zhCNCoreMessages: Messages = {
   'settings.appLock.validation.mismatch': '两次输入的新密码不一致。',
   'settings.appLock.validation.incorrect': '当前锁定密码不正确。',
 
+  // Settings > System > Auto Launch
+  'settings.autoLaunch.title': '开机自启动',
+  'settings.autoLaunch.enabled': '开机自动启动',
+  'settings.autoLaunch.enabledDesc': '系统启动时自动运行 Netcatty，并隐藏到系统托盘。',
+  'settings.autoLaunch.unsupportedDesc': '当前平台不支持此功能，或处于开发环境。',
+
   // Settings > System > Network Proxy
   'settings.system.networkProxy.title': '网络代理',
   'settings.system.networkProxy.description': '用于云同步与 AI 服务商的 HTTP(S) 代理。与 SSH 的 ProxyJump / ProxyCommand 配置无关。',
@@ -712,6 +718,7 @@ export const zhCNCoreMessages: Messages = {
   // Vault hosts header/actions
   'vault.hosts.search.placeholder': '查找主机或 ssh user@hostname / ssh -p 2222 user@hostname…',
   'vault.hosts.connect': '连接',
+  'vault.hosts.openSftp': '打开 SFTP',
   'vault.view.grid': '网格',
   'vault.view.list': '列表',
   'vault.view.tree': '树形',
@@ -804,6 +811,10 @@ export const zhCNCoreMessages: Messages = {
   'vault.import.mobaxterm.utf8Desc': '适用于已保存或转换为 UTF-8 的文件。',
   'vault.import.mobaxterm.gb18030': '中文 Windows',
   'vault.import.mobaxterm.gb18030Desc': '适用于中文 Windows 上导出的旧版文件。',
+  'vault.import.mobaxterm.masterPassword': '主密码（可选）',
+  'vault.import.mobaxterm.masterPasswordPlaceholder': '输入 MobaXterm 主密码',
+  'vault.import.mobaxterm.masterPasswordHint':
+    '导入 .mobaconf 或 MobaXterm.ini 中保存的密码时需要填写。留空则只导入会话。',
   'vault.import.sshConfig.chooseMode': '选择如何导入你的 SSH config 文件。',
   'vault.import.sshConfig.modeQuestion': '你希望如何导入？',
   'vault.import.sshConfig.importOnly': '仅导入',
@@ -893,6 +904,12 @@ export const zhCNCoreMessages: Messages = {
   'sftp.bookmark.addGlobal': '+全局',
   'sftp.bookmark.addGlobalTooltip': '保存为全局收藏（所有主机共享）',
   'sftp.bookmark.empty': '暂无收藏路径',
+  'sftp.bookmark.removeConfirm': '删除收藏 {path}？',
+  'sftp.bookmark.manage': '管理',
+  'sftp.bookmark.rename': '重命名收藏',
+  'sftp.bookmark.done': '完成',
+  'sftp.bookmark.moveUp': '上移 {label}',
+  'sftp.bookmark.moveDown': '下移 {label}',
   'sftp.columns.name': '名称',
   'sftp.columns.configure': '选择显示的列',
   'sftp.columns.modified': '修改时间',
@@ -933,6 +950,10 @@ export const zhCNCoreMessages: Messages = {
   'sftp.viewMode.tree': '树形视图',
   'sftp.viewMode.switchToList': '切换到列表视图',
   'sftp.viewMode.switchToTree': '切换到树形视图',
+  'sftp.listDensity.compact': '紧凑列表',
+  'sftp.listDensity.comfortable': '宽松列表',
+  'sftp.listDensity.switchToCompact': '切换到紧凑列表',
+  'sftp.listDensity.switchToComfortable': '切换到宽松列表',
   'sftp.tree.loadError': '加载目录失败',
   'sftp.tree.loading': '加载中...',
   'sftp.kind.folder': '文件夹',
@@ -1027,6 +1048,7 @@ export const zhCNCoreMessages: Messages = {
   'sftp.encoding.utf8': 'UTF-8',
   'sftp.encoding.gb18030': 'GB18030',
   'sftp.goHome': '返回主目录',
+  'sftp.goRoot': '回到根目录',
   'sftp.folderName': '文件夹名称',
   'sftp.folderName.placeholder': '输入文件夹名称',
   'sftp.fileName': '文件名称',

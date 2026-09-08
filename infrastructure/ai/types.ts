@@ -1,5 +1,5 @@
 // AI Provider types
-import defaultCommandBlocklist from '../../lib/commandBlocklist.json';
+import commandBlocklistTable from '../../lib/commandBlocklist.json';
 import type { AgentActivity, AgentUsage } from '../../domain/agentActivity';
 import type { ProviderContinuation } from './providerContinuation';
 
@@ -105,6 +105,10 @@ export interface ChatMessageAttachment {
   filename?: string;
   filePath?: string;    // original filesystem path, when available
   terminalSelection?: boolean;
+  /** Set when the attachment was created from a Vault → Notes mention. */
+  vaultNoteId?: string;
+  /** Original note title, for display and prompt labels. */
+  vaultNoteTitle?: string;
   previewText?: string;
   lineCount?: number;
 }
@@ -117,6 +121,10 @@ export interface UploadedFile {
   mediaType: string;
   filePath?: string;
   terminalSelection?: boolean;
+  /** Set when the attachment was created from a Vault → Notes mention. */
+  vaultNoteId?: string;
+  /** Original note title, for display and prompt labels. */
+  vaultNoteTitle?: string;
   previewText?: string;
   lineCount?: number;
 }
@@ -387,7 +395,10 @@ export interface AISettings {
 }
 
 export const DEFAULT_COMMAND_BLOCKLIST = [
-  ...defaultCommandBlocklist,
+  ...commandBlocklistTable.common,
+  ...commandBlocklistTable.posixNative,
+  ...commandBlocklistTable.posix,
+  ...commandBlocklistTable.powershell,
 ];
 
 export const DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;

@@ -819,6 +819,19 @@ function createPreloadApi(ctx) {
       sessionId,
       expectedEndpoint: options,
     });
+    if (
+      options?.requireExactSourceSession === true
+      && result.sourceSessionId !== sessionId
+    ) {
+      if (result.sftpId) {
+        try {
+          await ipcRenderer.invoke("netcatty:sftp:close", { sftpId: result.sftpId });
+        } catch {
+          // Best-effort cleanup before rejecting an invalid strict binding.
+        }
+      }
+      throw new Error("The requested terminal connection is no longer available");
+    }
     return result.sftpId;
   },
   listSftp: async (sftpId, path, encoding) => {
@@ -1163,6 +1176,11 @@ function createPreloadApi(ctx) {
   // Cloud sync session (in-memory only, shared across windows)
   cloudSyncSetSessionPassword: (password) =>
     ipcRenderer.invoke("netcatty:cloudSync:session:setPassword", password),
+  onCloudSyncSessionPasswordAvailable: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on("netcatty:cloudSync:session:passwordAvailable", handler);
+    return () => ipcRenderer.removeListener("netcatty:cloudSync:session:passwordAvailable", handler);
+  },
   cloudSyncGetSessionPassword: () =>
     ipcRenderer.invoke("netcatty:cloudSync:session:getPassword"),
   cloudSyncClearSessionPassword: () =>
@@ -1523,6 +1541,12 @@ function createPreloadApi(ctx) {
   isCloseToTray: () =>
     ipcRenderer.invoke("netcatty:tray:isCloseToTray"),
 
+  // Auto Launch at system login (hidden to tray)
+  getAutoLaunch: () =>
+    ipcRenderer.invoke("netcatty:autoLaunch:get"),
+  setAutoLaunch: (enabled) =>
+    ipcRenderer.invoke("netcatty:autoLaunch:set", { enabled }),
+
   // App-level HTTP(S) network proxy (cloud sync / AI providers)
   setHttpNetworkProxy: (settings) =>
     ipcRenderer.invoke("netcatty:networkProxy:set", settings),
@@ -1824,6 +1848,9 @@ function createPreloadApi(ctx) {
   },
   aiUserSkillsBuildContext: async (prompt, selectedSkillSlugs) => {
     return ipcRenderer.invoke("netcatty:ai:user-skills:build-context", { prompt, selectedSkillSlugs });
+  },
+  aiSkillsCliGetInvocation: async () => {
+    return ipcRenderer.invoke("netcatty:ai:skills-cli:invocation");
   },
   // MCP approval gate: renderer receives approval requests from main process
   onMcpApprovalRequest: (cb) => {

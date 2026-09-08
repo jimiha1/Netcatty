@@ -1,3 +1,4 @@
+import { stringCellWidth } from "../autocomplete/terminalStringCellWidth";
 import { FitAddon } from "@xterm/addon-fit";
 import { ImageAddon } from "@xterm/addon-image";
 import { SearchAddon } from "@xterm/addon-search";
@@ -82,6 +83,7 @@ import {
   createKittyKeyboardBroadcastHandler,
   flushKittyKeyboardBroadcastReleases,
   registerKittyKeyboardBroadcastHandler,
+  resolveWin32InputLogicalData,
   upsertKittyKeyboardForwardedPress,
   type KittyKeyboardBroadcastInput,
   type KittyKeyboardForwardedPress,
@@ -91,6 +93,7 @@ import { terminalAltKeyOptions } from "./altKeyOptions";
 import { optionArrowWordJumpSequence } from "./optionArrowWordJump";
 import { optionYankLastArgSequence } from "./optionYankLastArg";
 import { watchDevicePixelRatio } from "./rendererDprWatch";
+import { dispatchWin32InputModeEvent } from "./win32InputMode";
 import { shouldDeferWebglUntilVisible } from "./webglRendererPolicy";
 import { createWebglRendererController } from "./webglRendererController";
 import {
@@ -102,7 +105,7 @@ import { handleSerialLineModeInput } from "./serialLineInput";
 import {
   doesKittyEncodingPreserveShiftEnter,
   getShiftEnterSubmittedInput,
-  resolveShiftEnterPayload,
+  resolveShiftEnterText,
   shouldSendShiftEnterText,
 } from "./shiftEnterText";
 import {
@@ -390,6 +393,8 @@ export type CreateXTermRuntimeContext = {
   onAutocompleteKeyEvent?: (e: KeyboardEvent) => boolean;
   // Autocomplete input handler — called on every character input
   onAutocompleteInput?: (data: string) => void;
+  // Recompute the popup after wrap/scroll so it follows the command start (#3061)
+  onAutocompleteReposition?: () => void;
 
   terminalContextActionsRef?: RefObject<{
     onPaste?: () => void | Promise<void>;
@@ -546,6 +551,12 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
   const term = new XTerm({
     ...performanceConfig.options,
     ...(windowsPty ? { windowsPty } : {}),
+    // ConPTY asks the frontend for Win32 INPUT_RECORD encoding with DECSET
+    // 9001. Preserve browser key modifiers for native Windows applications
+    // instead of collapsing them into legacy VT bytes.
+    vtExtensions: {
+      win32InputMode: windowsPty?.backend === "conpty",
+    },
     // Override ignoreBracketedPasteMode if user explicitly disables bracketed paste
     ignoreBracketedPasteMode: settings?.disableBracketedPaste ?? performanceConfig.options.ignoreBracketedPasteMode,
     // Rescale glyphs that would visually overlap into the next cell (CJK compliance)
@@ -1055,7 +1066,43 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     overlay.style.fontSize = `${currentTerminalFontSize()}px`;
     overlay.style.fontFamily = String(term.options.fontFamily ?? fontFamily);
     overlay.style.lineHeight = String(term.options.lineHeight ?? lineHeight);
-    overlay.textContent = previewRows.map((row) => row.text).join("\n");
+    // Native font advances differ from xterm's device-pixel-rounded cells.
+    // Fit each row to its terminal cell width, including double-width glyphs,
+    // rather than applying a single-cell correction once per Unicode glyph.
+    overlay.style.fontWeight = String(term.options.fontWeight ?? "normal");
+    overlay.style.fontKerning = "none";
+    overlay.style.fontVariantLigatures = "none";
+    const screenRect = term.element?.querySelector(".xterm-screen")?.getBoundingClientRect();
+    if (screenRect && screenRect.width > 0 && screenRect.height > 0
+      && term.cols > 0 && term.rows > 0) {
+      overlay.style.lineHeight = `${screenRect.height / term.rows}px`;
+      const rowElements = previewRows.map((row) => {
+        const span = document.createElement("span");
+        span.style.display = "inline-block";
+        span.style.verticalAlign = "top";
+        span.style.transformOrigin = "left top";
+        span.textContent = row.text;
+        return span;
+      });
+      const fragment = document.createDocumentFragment();
+      rowElements.forEach((span, index) => {
+        if (index > 0) fragment.appendChild(document.createTextNode("\n"));
+        fragment.appendChild(span);
+      });
+      overlay.replaceChildren(fragment);
+      // Batch all measurements before writing transforms to avoid one forced
+      // layout per row. Text nodes and explicit newlines stay unchanged for copy.
+      const nativeWidths = rowElements.map((span) => span.getBoundingClientRect().width);
+      rowElements.forEach((span, index) => {
+        const nativeWidth = nativeWidths[index];
+        const cells = stringCellWidth(previewRows[index].text, term);
+        if (nativeWidth > 0 && cells > 0) {
+          span.style.transform = `scaleX(${cells * screenRect.width / term.cols / nativeWidth})`;
+        }
+      });
+    } else {
+      overlay.textContent = previewRows.map((row) => row.text).join("\n");
+    }
     overlay.setAttribute(HISTORY_PREVIEW_WRAP_ATTR, encodeHistoryPreviewWrapFlags(previewRows));
     return true;
   };
@@ -1097,6 +1144,12 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     data: string,
     options?: {
       source?: "terminal" | "shift-enter" | "kitty";
+      /**
+       * User-facing input represented by a transport-specific wire payload.
+       * `null` means the payload has no text/editing semantics (for example a
+       * Win32 key-up record). The wire `data` is still written unchanged.
+       */
+      logicalData?: string | null;
       /** Skip string broadcast when peers will re-resolve from a key chord. */
       skipBroadcast?: boolean;
       /**
@@ -1115,11 +1168,16 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     // cause the executed command to fail (#3138).
     data = sanitizeTerminalInput(data);
     if (!data) return;
+    const logicalData = options?.logicalData === null
+      ? null
+      : sanitizeTerminalInput(options?.logicalData ?? data);
 
     // Clipboard paste / typed password while assist is open must dismiss the
     // hint first. Otherwise Enter is still hijacked for confirmFill and can
     // append the host session password after the user's pasted secret (#2198).
-    ctx.sudoAutofillRef?.current?.dismissOnUserContentInput(data);
+    if (logicalData) {
+      ctx.sudoAutofillRef?.current?.dismissOnUserContentInput(logicalData);
+    }
 
     const inputSource = options?.source ?? "terminal";
     const id = ctx.sessionRef.current;
@@ -1127,13 +1185,18 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     const sensitive = ctx.passwordPromptActiveRef?.current === true;
     let handledSubmittedInput = false;
     const submittedInput: { text: string; lineEnding: "\r\n" | "\r" | "\n" } | null =
-      inputSource === "shift-enter"
-        ? getShiftEnterSubmittedInput(data)
-        : data === "\r" || data === "\n"
-          ? { text: "", lineEnding: data as "\r" | "\n" }
+      logicalData === null
+        ? null
+        : inputSource === "shift-enter"
+          ? getShiftEnterSubmittedInput(logicalData)
+          : logicalData === "\r" || logicalData === "\n"
+            ? { text: "", lineEnding: logicalData as "\r" | "\n" }
           : null;
     const onBroadcastInput = ctx.onBroadcastInputRef.current;
-    const broadcastDataBeforeSudo = mapTerminalBackspaceInput(data, ctx.host.backspaceBehavior);
+    const broadcastDataBeforeSudo = mapTerminalBackspaceInput(
+      logicalData ?? "",
+      ctx.host.backspaceBehavior,
+    );
     const suppressTerminalBroadcast = inputSource === "terminal" && suppressNextTerminalDataBroadcast;
     if (suppressTerminalBroadcast) suppressNextTerminalDataBroadcast = false;
     // skipBroadcast only suppresses the raw-string fan-out. Peers still receive
@@ -1180,7 +1243,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       !handlingKittyBroadcast &&
       inputSource !== "shift-enter"
     ) {
-      const pastedCommand = getSinglePastedCommand(data);
+      const pastedCommand = logicalData === null ? null : getSinglePastedCommand(logicalData);
       if (pastedCommand) {
         if (ctx.passwordPromptActiveRef) ctx.passwordPromptActiveRef.current = false;
         const recordedCommand = recordTerminalCommandExecution(
@@ -1244,43 +1307,50 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         }
       }
 
-      // Use remapped data so broadcast peers also receive the correct byte
-      const broadcastData = mapTerminalBackspaceInput(dataToWrite, ctx.host.backspaceBehavior);
+      // Use logical data for raw-string broadcast. Transport-specific wire
+      // records are dispatched separately from their normalized key event.
+      const broadcastData = mapTerminalBackspaceInput(
+        logicalData ?? "",
+        ctx.host.backspaceBehavior,
+      );
       if (willBroadcastInput) {
         onBroadcastInput?.(broadcastData, ctx.sessionId);
       }
 
-      if (!shouldSuppressTerminalInputScrollForUserPaste(term, data)) {
-        scrollToBottomAfterInput(data);
+      if (
+        logicalData !== null &&
+        !shouldSuppressTerminalInputScrollForUserPaste(term, logicalData)
+      ) {
+        scrollToBottomAfterInput(logicalData);
       }
 
       // Notify autocomplete of input
-      ctx.onAutocompleteInput?.(data);
+      if (logicalData !== null) ctx.onAutocompleteInput?.(logicalData);
 
-      if (ctx.statusRef.current === "connected") {
+      if (ctx.statusRef.current === "connected" && logicalData !== null) {
         if (handledSubmittedInput || submittedInput) {
           // Command recording and sudo command preparation happen before the
           // input is written so sudo can receive a one-time prompt marker.
-        } else if (data === "\x7f" || data === "\b") {
+        } else if (logicalData === "\x7f" || logicalData === "\b") {
           ctx.commandBufferRef.current = ctx.commandBufferRef.current.slice(0, -1);
           ctx.scriptRecorderRef?.current?.recordBackspace();
-        } else if (data === "\x03") {
+        } else if (logicalData === "\x03") {
           ctx.commandBufferRef.current = "";
           ctx.scriptRecorderRef?.current?.recordClearLine();
           // Hard-abort password assist when Ctrl+C reaches the input path
           // (e.g. broadcast peers) so a later su re-arms cleanly (#2191).
           ctx.sudoAutofillRef?.current?.abort();
-        } else if (data === "\x15") {
+        } else if (logicalData === "\x15") {
           ctx.commandBufferRef.current = "";
           ctx.scriptRecorderRef?.current?.recordClearLine();
-        } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
-          ctx.commandBufferRef.current += data;
-          ctx.scriptRecorderRef?.current?.recordInput(data);
-        } else if (data.length > 1 && !data.startsWith("\x1b")) {
-          ctx.commandBufferRef.current += data;
-          ctx.scriptRecorderRef?.current?.recordInput(data);
+        } else if (logicalData.length === 1 && logicalData.charCodeAt(0) >= 32) {
+          ctx.commandBufferRef.current += logicalData;
+          ctx.scriptRecorderRef?.current?.recordInput(logicalData);
+        } else if (logicalData.length > 1 && !logicalData.startsWith("\x1b")) {
+          ctx.commandBufferRef.current += logicalData;
+          ctx.scriptRecorderRef?.current?.recordInput(logicalData);
         } else {
-          const pastedLine = getSingleBracketedPasteLine(data);
+          const pastedLine = getSingleBracketedPasteLine(logicalData);
           if (pastedLine) {
             ctx.commandBufferRef.current += pastedLine;
             ctx.scriptRecorderRef?.current?.recordInput(pastedLine);
@@ -1294,8 +1364,14 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
   let kittyCompositionClearTimer: number | undefined;
   let imeTextInputDeferredKey: string | null = null;
   let imeTextInputDeferredKittyEvent: KittyKeyboardEvent | null = null;
+  let win32InputModePendingEvent: {
+    event: KittyKeyboardEvent;
+    logicalData: string | null;
+  } | null = null;
+  const win32InputModeForwardedKeys = new Map<string, KittyKeyboardForwardedPress>();
   const kittyForwardedKeys = new Map<string, KittyKeyboardForwardedPress>();
   const broadcastForwardedKeys = new Map<string, KittyKeyboardForwardedPress>();
+  const win32BroadcastForwardedKeys = new Map<string, KittyKeyboardForwardedPress>();
   const broadcastEncodedKeys = new Set<string>();
   const broadcastLegacySuppressedKeys = new Set<string>();
   const kittyKeyIdentity = (event: KeyboardEvent): string => event.code || event.key;
@@ -1355,6 +1431,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     if (
       isUnchangedDeferredImeTextInput(deferredKey, text) &&
       deferredKittyEvent &&
+      !term.modes.win32InputMode &&
       kittyKeyboardProtocolEnabled
     ) {
       const pressEvent: KittyKeyboardEvent = {
@@ -1406,6 +1483,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         // on the text path, but still emits a paired :3 release on keyup.
         // Mirror the ordinary keydown handler so that release is not dropped.
         if (
+          !term.modes.win32InputMode &&
           kittyKeyboardProtocolEnabled &&
           shouldTrackKittyKeyRelease(kittyKeyboardMode, pressEvent)
         ) {
@@ -1441,7 +1519,9 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     // Kitty escape sequences that bypass the handleTerminalInputData guard (#3138).
     const sanitizedText = sanitizeTerminalInput(text);
     if (!sanitizedText) return;
-    const encoded = encodeKittyCompositionText(kittyKeyboardMode, sanitizedText);
+    const encoded = term.modes.win32InputMode
+      ? null
+      : encodeKittyCompositionText(kittyKeyboardMode, sanitizedText);
     if (encoded) {
       handleTerminalInputData(encoded, { source: "kitty" });
     } else {
@@ -1489,6 +1569,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       );
     }
     if (!kittyForwardedKeys.delete(identity)) return false;
+    if (term.modes.win32InputMode) return false;
     const sequence = kittyKeyboardProtocolEnabled
       ? encodeKittyKeyEvent(kittyKeyboardMode, event)
       : null;
@@ -1576,7 +1657,27 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         }
       }
       const identity = kittyKeyIdentity(releaseEvent);
+      const hasForwardedWin32KeyDown = win32InputModeForwardedKeys.delete(identity);
       if (broadcastLegacyDataPending === identity) clearBroadcastLegacyDataPending();
+      if (term.modes.win32InputMode) {
+        // Broadcast peers may still need a paired Kitty release for a keydown
+        // consumed by a Netcatty action (notably the urgent Ctrl+C path).
+        releaseForwardedKittyPress(toKittyKeyboardEvent(releaseEvent));
+        kittyForwardedKeys.delete(identity);
+        // Only let xterm emit a Win32 key-up when its matching keydown was
+        // previously handed to xterm. Netcatty shortcuts, sudo controls and
+        // autocomplete consume their keydown and must not leak an orphaned
+        // native release into the PTY.
+        if (!hasForwardedWin32KeyDown) {
+          win32InputModePendingEvent = null;
+          return false;
+        }
+        win32InputModePendingEvent = {
+          event: toKittyKeyboardEvent(releaseEvent),
+          logicalData: null,
+        };
+        return true;
+      }
       if (releaseForwardedKittyPress(toKittyKeyboardEvent(releaseEvent))) {
         e.preventDefault();
         e.stopPropagation();
@@ -1596,6 +1697,13 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       )
     ) {
       return false;
+    }
+
+    if (e.type === "keypress" && broadcastForwardedKeys.has(kittyKeyIdentity(e))) {
+      // Space and uppercase letters can emit xterm data from keypress, after
+      // keydown's zero-delay cleanup. Rejoin that physical broadcast instead
+      // of sending the same character a second time as unpaired raw text.
+      markBroadcastLegacyDataPending(kittyKeyIdentity(e));
     }
 
     if (e.type !== "keydown") {
@@ -1744,6 +1852,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     }
 
     const kittySequenceForKeyDown =
+      !term.modes.win32InputMode &&
       kittyKeyboardProtocolEnabled
         ? encodeKittyKeyEvent(kittyKeyboardMode, toKittyKeyboardEvent(e))
         : null;
@@ -1803,6 +1912,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         const kittyEvent = toKittyKeyboardEvent(e);
         const identity = kittyKeyIdentity(e);
         if (
+          !term.modes.win32InputMode &&
           kittyKeyboardProtocolEnabled &&
           shouldTrackKittyKeyRelease(kittyKeyboardMode, kittyEvent)
         ) {
@@ -1969,11 +2079,15 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       return false;
     }
 
-    // Before Kitty encoding that collapses Shift+Enter to bare CR/LF (flags=0,
-    // or non-preserving sets like alternate-key / associated-text alone). Remap
-    // first so alternate-screen TUIs still receive CSI-u Shift+Enter.
+    // ConPTY's negotiated Win32 input mode keeps the native modifier and owns
+    // this event. Otherwise, before Kitty encoding that collapses Shift+Enter
+    // to bare CR/LF (flags=0, or non-preserving sets like alternate-key /
+    // associated-text alone), keep the configured send-text fallback. Only
+    // negotiated preserving modes may emit CSI-u; alternate-screen activation
+    // is not a capability signal.
     if (
       shouldSendShiftEnterText(e, ctx.terminalSettingsRef.current) &&
+      !term.modes.win32InputMode &&
       !doesKittyEncodingPreserveShiftEnter(kittySequenceForKeyDown)
     ) {
       const id = ctx.sessionRef.current;
@@ -1981,24 +2095,16 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         e.preventDefault();
         e.stopPropagation();
         const kittyEvent = toKittyKeyboardEvent(e);
-        // Local payload uses this session's buffer. Broadcast targets re-resolve
-        // from the key chord via resolveKittyKeyboardBroadcastInput.
-        const shiftEnterPayload = resolveShiftEnterPayload(
+        const shiftEnterText = resolveShiftEnterText(
           ctx.terminalSettingsRef.current,
-          { alternateScreen: term.buffer.active.type === "alternate" },
         );
-        if (shiftEnterPayload.data) {
-          if (shiftEnterPayload.kind === "key") {
-            // Local CSI-u as kitty-sourced input so raw bytes are not broadcast.
-            handleTerminalInputData(shiftEnterPayload.data, { source: "kitty" });
-          } else {
-            // Skip string broadcast: peers resolve Shift+Enter from their own
-            // buffer + keyboard mode via the key chord below.
-            handleTerminalInputData(shiftEnterPayload.data, {
-              source: "shift-enter",
-              skipBroadcast: true,
-            });
-          }
+        if (shiftEnterText) {
+          // Skip string broadcast: peers resolve Shift+Enter from their own
+          // negotiated keyboard mode via the key chord below.
+          handleTerminalInputData(shiftEnterText, {
+            source: "shift-enter",
+            skipBroadcast: true,
+          });
           const forwarded = broadcastKittyInput({
             kind: "key",
             event: kittyEvent,
@@ -2085,6 +2191,19 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     }
 
     const normalizedKittyEvent = toKittyKeyboardEvent(e);
+    if (term.modes.win32InputMode) {
+      // The following xterm onData callback carries the lossless record.
+      // Keep its normalized event alongside it for non-Win32 broadcast peers
+      // and for local command/autocomplete bookkeeping.
+      win32InputModePendingEvent = {
+        event: normalizedKittyEvent,
+        logicalData: resolveWin32InputLogicalData(
+          normalizedKittyEvent,
+          term.modes.applicationCursorKeysMode,
+        ),
+      };
+      return true;
+    }
     if (!shouldDeferKittyKeyEvent(normalizedKittyEvent)) {
       const identity = kittyKeyIdentity(e);
       if (
@@ -2184,7 +2303,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       kittyCompositionClearTimer = undefined;
     }
     if (
-      shouldEncodeKittyCompositionText(kittyKeyboardMode) ||
+      (!term.modes.win32InputMode && shouldEncodeKittyCompositionText(kittyKeyboardMode)) ||
       (ctx.isBroadcastEnabledRef.current && ctx.onBroadcastInputRef.current)
     ) {
       kittyCompositionPending = true;
@@ -2203,16 +2322,30 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       kittyCompositionClearTimer = undefined;
     }, 0);
   };
+  const writeWin32InputModeEvent = (
+    event: KittyKeyboardEvent,
+    logicalData: string | null,
+  ) => {
+    const pending = { event, logicalData };
+    win32InputModePendingEvent = pending;
+    dispatchWin32InputModeEvent(term, event);
+    if (win32InputModePendingEvent === pending) {
+      win32InputModePendingEvent = null;
+    }
+  };
   const clearKittyConnectionInputState = () => {
     // Drop deferred IME punctuation on session reset; do not write into the
     // next connection. Focus loss uses clearKittyTransientInputState instead.
     clearImeTextInputDeferral();
     kittyCompositionPending = false;
+    win32InputModePendingEvent = null;
+    win32InputModeForwardedKeys.clear();
     kittyForwardedKeys.clear();
     clearKittyKeyboardBroadcastPairingState(
       broadcastEncodedKeys,
       broadcastLegacySuppressedKeys,
     );
+    win32BroadcastForwardedKeys.clear();
     clearBroadcastLegacyDataPending();
     if (kittyCompositionClearTimer !== undefined) {
       window.clearTimeout(kittyCompositionClearTimer);
@@ -2221,17 +2354,40 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
   };
   const clearKittyTransientInputState = () => {
     flushImeTextInputDeferral();
+    if (term.modes.win32InputMode) {
+      // Browsers do not deliver key-up after focus leaves the terminal. Release
+      // every Win32 key that xterm actually handed to ConPTY so native TUI key
+      // state cannot remain stuck after switching tabs or windows.
+      flushKittyKeyboardBroadcastReleases(
+        win32InputModeForwardedKeys,
+        (input) => {
+          if (input.kind === "key") {
+            writeWin32InputModeEvent(input.event, null);
+          }
+        },
+        kittyKeyboardLockState,
+      );
+      kittyForwardedKeys.clear();
+      win32InputModePendingEvent = null;
+    } else {
+      win32InputModeForwardedKeys.clear();
+      flushKittyKeyboardBroadcastReleases(
+        kittyForwardedKeys,
+        (input) => {
+          if (input.kind !== "key" || !kittyKeyboardProtocolEnabled) return;
+          const sequence = encodeKittyKeyEvent(kittyKeyboardMode, input.event);
+          if (sequence) handleTerminalInputData(sequence, { source: "kitty" });
+        },
+        kittyKeyboardLockState,
+      );
+    }
     flushKittyKeyboardBroadcastReleases(
-      kittyForwardedKeys,
-      (input) => {
-        if (input.kind !== "key" || !kittyKeyboardProtocolEnabled) return;
-        const sequence = encodeKittyKeyEvent(kittyKeyboardMode, input.event);
-        if (sequence) handleTerminalInputData(sequence, { source: "kitty" });
-      },
+      broadcastForwardedKeys,
+      broadcastKittyInput,
       kittyKeyboardLockState,
     );
     flushKittyKeyboardBroadcastReleases(
-      broadcastForwardedKeys,
+      win32BroadcastForwardedKeys,
       broadcastKittyInput,
       kittyKeyboardLockState,
     );
@@ -2261,6 +2417,60 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
   textarea?.addEventListener("blur", clearKittyTransientInputState);
 
   term.onData((data) => {
+    const win32Input = win32InputModePendingEvent;
+    if (
+      win32Input &&
+      term.modes.win32InputMode &&
+      data.startsWith("\u001b[") &&
+      /^\[\d+;\d+;\d+;[01];\d+;\d+_$/.test(data.slice(1))
+    ) {
+      win32InputModePendingEvent = null;
+      if (win32Input.event.type === "keydown") {
+        upsertKittyKeyboardForwardedPress(
+          win32InputModeForwardedKeys,
+          win32Input.event.code || win32Input.event.key,
+          win32Input.event,
+          [],
+        );
+      }
+      const identity = win32Input.event.code || win32Input.event.key;
+      const broadcastInput: KittyKeyboardBroadcastInput = {
+        kind: "win32",
+        data,
+        event: win32Input.event,
+        fallbackToLegacy: true,
+      };
+      if (win32Input.event.type === "keyup") {
+        const forwardedPress = win32BroadcastForwardedKeys.get(identity);
+        win32BroadcastForwardedKeys.delete(identity);
+        if (forwardedPress) {
+          broadcastKittyInput(
+            broadcastInput,
+            true,
+            forwardedPress.targetSessionIds,
+          );
+        }
+      } else {
+        const forwarded = broadcastKittyInput(broadcastInput);
+        if (forwarded) {
+          upsertKittyKeyboardForwardedPress(
+            win32BroadcastForwardedKeys,
+            identity,
+            win32Input.event,
+            forwarded.targetSessionIds,
+          );
+        }
+      }
+      handleTerminalInputData(data, {
+        logicalData: win32Input.logicalData,
+        skipBroadcast: true,
+      });
+      return;
+    }
+    // insertText can follow an already-delivered keypress. Its fallback marker
+    // must not classify the next physical key as a second composition commit.
+    // Actual composition/input handlers clear the physical-key pairing first.
+    if (broadcastLegacyDataPending) kittyCompositionPending = false;
     if (kittyCompositionPending && !data.startsWith("\u001b")) {
       kittyCompositionPending = false;
       if (kittyCompositionClearTimer !== undefined) {
@@ -2271,7 +2481,9 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       // Kitty escape sequences that bypass the handleTerminalInputData guard (#3138).
       const sanitizedData = sanitizeTerminalInput(data);
       if (!sanitizedData) return;
-      const encoded = encodeKittyCompositionText(kittyKeyboardMode, sanitizedData);
+      const encoded = term.modes.win32InputMode
+        ? null
+        : encodeKittyCompositionText(kittyKeyboardMode, sanitizedData);
       if (encoded) {
         handleTerminalInputData(encoded, { source: "kitty" });
       } else {
@@ -2316,7 +2528,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       applicationCursorMode: term.modes.applicationCursorKeysMode,
       encodedKeys: broadcastEncodedKeys,
       legacySuppressedKeys: broadcastLegacySuppressedKeys,
-      alternateScreen: term.buffer.active.type === "alternate",
+      win32InputMode: term.modes.win32InputMode,
       shiftEnterSettings: ctx.terminalSettingsRef.current,
     }),
     getSessionId: () => ctx.sessionRef.current,
@@ -2331,7 +2543,13 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       mapTerminalBackspaceInput(data, ctx.host.backspaceBehavior),
       { sensitive: ctx.passwordPromptActiveRef?.current === true },
     ),
-    writeActive: (data) => handleTerminalInputData(data, { source: "kitty" }),
+    writeActive: (data, logicalData) => handleTerminalInputData(data, {
+      source: "kitty",
+      logicalData,
+    }),
+    writeWin32Event: (event, logicalData) => {
+      writeWin32InputModeEvent(event, logicalData);
+    },
   });
   registerKittyKeyboardBroadcastHandler(
     ctx.sessionId,
@@ -2563,6 +2781,17 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     },
   );
   term.onResize(({ cols, rows }) => {
+    // An idle alternate-screen application may emit nothing after resizing.
+    // Update history now, using xterm's cursor after any normal-buffer reflow.
+    const buffer = term.buffer.active;
+    const cursorLine = buffer.getLine(buffer.baseY + buffer.cursorY);
+    ctx.terminalOutputHistory?.syncViewportAfterResize({
+      cols, rows,
+      cursorX: buffer.cursorX,
+      cursorY: buffer.cursorY,
+      cursorLine: cursorLine?.translateToString(true, 0, cols) ?? "",
+      isWrapped: cursorLine?.isWrapped ?? false,
+    });
     // A reflow can leave stale glyphs in the WebGL atlas; clear it so the new
     // dimensions re-rasterize cleanly (issue #1049).
     clearWebglTextureAtlas();
@@ -2570,6 +2799,31 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     if (!id) return;
     resizeScheduler.schedule({ sessionId: id, cols, rows });
   });
+
+  let autocompleteRepositionFrame = 0;
+  const scheduleAutocompleteReposition = () => {
+    const run = () => ctx.onAutocompleteReposition?.();
+    if (typeof requestAnimationFrame !== "function") {
+      run();
+      return;
+    }
+    // onLineFeed fires per newline. Coalesce to one rAF so a burst cannot
+    // enqueue thousands of React updates (#3204).
+    if (autocompleteRepositionFrame) return;
+    autocompleteRepositionFrame = requestAnimationFrame(() => {
+      autocompleteRepositionFrame = 0;
+      run();
+    });
+  };
+  const cancelAutocompleteReposition = () => {
+    if (!autocompleteRepositionFrame) return;
+    cancelAnimationFrame(autocompleteRepositionFrame);
+    autocompleteRepositionFrame = 0;
+  };
+  // Soft-wrap at the bottom scrolls the buffer without a fit/resize. Keep the
+  // popup glued to the command start instead of a stale viewport cell (#3061).
+  const autocompleteScrollDisposable = term.onScroll(scheduleAutocompleteReposition);
+  const autocompleteLineFeedDisposable = term.onLineFeed?.(scheduleAutocompleteReposition);
 
   const keywordHighlighter = new KeywordHighlighter(term, {
     serializeAddon,
@@ -2652,6 +2906,9 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       osc99Disposable.dispose();
       osc52Disposable.dispose();
       titleChangeDisposable.dispose();
+      cancelAutocompleteReposition();
+      autocompleteScrollDisposable.dispose();
+      autocompleteLineFeedDisposable?.dispose();
       bellDisposable.dispose();
       cursorPreferenceDisposable?.dispose();
       // Release decoded bitmaps and the image canvas layers before xterm tears the

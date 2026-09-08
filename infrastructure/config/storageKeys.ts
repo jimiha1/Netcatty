@@ -129,6 +129,8 @@ export const STORAGE_KEY_SFTP_TRANSFER_CENTER = 'netcatty_sftp_transfer_center_v
 export const STORAGE_KEY_SFTP_AUTO_OPEN_SIDEBAR = 'netcatty_sftp_auto_open_sidebar_v1';
 export const STORAGE_KEY_SFTP_FOLLOW_TERMINAL_CWD = 'netcatty_sftp_follow_terminal_cwd_v1';
 export const STORAGE_KEY_SFTP_DEFAULT_VIEW_MODE = 'netcatty_sftp_default_view_mode_v1';
+/** Compact vs comfortable SFTP file-list row density. */
+export const STORAGE_KEY_SFTP_LIST_DENSITY = 'netcatty_sftp_list_density_v1';
 export const STORAGE_KEY_SFTP_HOST_VIEW_MODES = 'netcatty_sftp_host_view_modes_v1';
 export const STORAGE_KEY_SFTP_VISIBLE_COLUMNS = 'netcatty_sftp_visible_columns_v1';
 export const STORAGE_KEY_SFTP_DIRECTORIES_FIRST = 'netcatty_sftp_directories_first_v1';
@@ -169,6 +171,8 @@ export const STORAGE_KEY_MANAGED_SOURCES = 'netcatty_managed_sources_v1';
 // Global Toggle Window Settings (Quake Mode)
 export const STORAGE_KEY_TOGGLE_WINDOW_HOTKEY = 'netcatty_toggle_window_hotkey_v1';
 export const STORAGE_KEY_CLOSE_TO_TRAY = 'netcatty_close_to_tray_v1';
+/** Optimistic cache only — the source of truth is app.getLoginItemSettings() in the main process. */
+export const STORAGE_KEY_AUTO_LAUNCH_ENABLED = 'netcatty_auto_launch_enabled_v1';
 /** App-level HTTP(S) proxy for cloud sync / AI (not SSH ProxyJump). */
 export const STORAGE_KEY_HTTP_NETWORK_PROXY = 'netcatty_http_network_proxy_v1';
 export const STORAGE_KEY_GLOBAL_HOTKEY_ENABLED = 'netcatty_global_hotkey_enabled_v1';

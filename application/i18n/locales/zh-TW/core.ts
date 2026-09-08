@@ -197,6 +197,12 @@ export const zhTWCoreMessages: Messages = {
   'settings.appLock.validation.mismatch': '兩次輸入的新密碼不一致。',
   'settings.appLock.validation.incorrect': '目前的鎖定密碼不正確。',
 
+  // Settings > System > Auto Launch
+  'settings.autoLaunch.title': '開機自動啟動',
+  'settings.autoLaunch.enabled': '開機時自動啟動',
+  'settings.autoLaunch.enabledDesc': '系統啟動時自動執行 Netcatty，並隱藏到系統匣。',
+  'settings.autoLaunch.unsupportedDesc': '目前平台不支援此功能，或處於開發環境。',
+
   // Settings > System > Network Proxy
   'settings.system.networkProxy.title': '網路代理',
   'settings.system.networkProxy.description': '用於雲端同步與 AI 服務商的 HTTP(S) 代理。與 SSH 的 ProxyJump / ProxyCommand 設定無關。',
@@ -715,6 +721,7 @@ export const zhTWCoreMessages: Messages = {
   // Vault hosts header/actions
   'vault.hosts.search.placeholder': '查詢主機或 ssh user@hostname / ssh -p 2222 user@hostname…',
   'vault.hosts.connect': '連線',
+  'vault.hosts.openSftp': '開啟 SFTP',
   'vault.view.grid': '網格',
   'vault.view.list': '列表',
   'vault.view.tree': '樹形',
@@ -807,6 +814,10 @@ export const zhTWCoreMessages: Messages = {
   'vault.import.mobaxterm.utf8Desc': '適用於已儲存或轉換為 UTF-8 的檔案。',
   'vault.import.mobaxterm.gb18030': '中文 Windows',
   'vault.import.mobaxterm.gb18030Desc': '適用於中文 Windows 上匯出的舊版檔案。',
+  'vault.import.mobaxterm.masterPassword': '主密碼（選填）',
+  'vault.import.mobaxterm.masterPasswordPlaceholder': '輸入 MobaXterm 主密碼',
+  'vault.import.mobaxterm.masterPasswordHint':
+    '匯入 .mobaconf 或 MobaXterm.ini 中已儲存的密碼時需要填寫。留空則只匯入工作階段。',
   'vault.import.sshConfig.chooseMode': '選擇如何匯入你的 SSH config 檔案。',
   'vault.import.sshConfig.modeQuestion': '你希望如何匯入？',
   'vault.import.sshConfig.importOnly': '僅匯入',
@@ -896,6 +907,12 @@ export const zhTWCoreMessages: Messages = {
   'sftp.bookmark.addGlobal': '+全域',
   'sftp.bookmark.addGlobalTooltip': '儲存為全域收藏（所有主機共享）',
   'sftp.bookmark.empty': '暫無收藏路徑',
+  'sftp.bookmark.removeConfirm': '刪除收藏 {path}？',
+  'sftp.bookmark.manage': '管理',
+  'sftp.bookmark.rename': '重新命名收藏',
+  'sftp.bookmark.done': '完成',
+  'sftp.bookmark.moveUp': '上移 {label}',
+  'sftp.bookmark.moveDown': '下移 {label}',
   'sftp.columns.name': '名稱',
   'sftp.columns.configure': '選擇顯示的欄位',
   'sftp.columns.modified': '修改時間',
@@ -936,6 +953,10 @@ export const zhTWCoreMessages: Messages = {
   'sftp.viewMode.tree': '樹形檢視',
   'sftp.viewMode.switchToList': '切換到列表檢視',
   'sftp.viewMode.switchToTree': '切換到樹形檢視',
+  'sftp.listDensity.compact': '緊湊列表',
+  'sftp.listDensity.comfortable': '寬鬆列表',
+  'sftp.listDensity.switchToCompact': '切換到緊湊列表',
+  'sftp.listDensity.switchToComfortable': '切換到寬鬆列表',
   'sftp.tree.loadError': '載入目錄失敗',
   'sftp.tree.loading': '載入中...',
   'sftp.kind.folder': '資料夾',
@@ -1030,6 +1051,7 @@ export const zhTWCoreMessages: Messages = {
   'sftp.encoding.utf8': 'UTF-8',
   'sftp.encoding.gb18030': 'GB18030',
   'sftp.goHome': '返回主目錄',
+  'sftp.goRoot': '回到根目錄',
   'sftp.folderName': '資料夾名稱',
   'sftp.folderName.placeholder': '輸入資料夾名稱',
   'sftp.fileName': '檔案名稱',

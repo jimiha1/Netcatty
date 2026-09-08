@@ -213,6 +213,7 @@ const SIDE_PANEL_LIVE_CTX_KEYS = [
   'sftpActiveHost',
   'activeTerminalSessionIdForSftp',
   'activeTerminalCwd',
+  'activeTerminalCwdTrusted',
   'activeWorkspace',
   'focusedFontFamilyId',
   'focusedFontFamilyOverridden',
@@ -429,6 +430,9 @@ const WORKSPACE_CTX_KEYS = [
   'onReorderTabs',
   'onStartSessionDrag',
   'onEndSessionDrag',
+  'isGlobalBroadcastEnabled',
+  'canUseGlobalBroadcast',
+  'onToggleGlobalBroadcast',
 ] as const;
 
 export function terminalLayerSidePanelStableCtxEqual(prev: Ctx, next: Ctx): boolean {
@@ -498,6 +502,7 @@ export function terminalLayerFocusSidebarPropsEqual(prev: Ctx, next: Ctx): boole
     && eq(prev, next, 'onAppendHostToWorkspace')
     && eq(prev, next, 'handleCloseSession')
     && eq(prev, next, 'onCopySession')
+    && eq(prev, next, 'onDuplicateSession')
     && eq(prev, next, 'onCopySessionToNewWindow')
     && eq(prev, next, 'onRemoveSessionFromWorkspace')
     && eq(prev, next, 'onSetWorkspaceFocusedSession')

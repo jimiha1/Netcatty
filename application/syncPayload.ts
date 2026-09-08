@@ -24,8 +24,11 @@ import {
   SYNC_PAYLOAD_ENTITY_KEYS,
   SYNC_STORAGE_KEYS,
   hasSyncPayloadEntityData,
+  retainLocalHostLastConnectedAt,
+  sanitizeHostsForSync,
   type SyncPayload,
 } from '../domain/sync';
+import { migrateLegacyCommandBlocklist } from '../domain/commandBlocklist';
 import { migrateHostsFromLegacyLineTimestamps } from '../domain/host';
 import { toPersistedPortForwardingRules } from '../domain/portForwardingPersistence';
 import {
@@ -41,6 +44,10 @@ import { localStorageAdapter } from '../infrastructure/persistence/localStorageA
 import { decryptField, encryptField } from '../infrastructure/persistence/secureFieldAdapter';
 import { sanitizeQuickMessages } from '../infrastructure/ai/quickMessages';
 import { emitAIStateChanged } from './state/aiStateEvents';
+import {
+  persistCommandBlocklistSetting,
+  readCommandBlocklistSetting,
+} from './state/commandBlocklistSettings';
 import { rehydrateGlobalSftpBookmarks } from './state/sftp/globalSftpBookmarks';
 import {
   nextTerminalFontSizeSyncVersion,
@@ -211,6 +218,8 @@ export function sanitizePortForwardingRulesForSync(
     lastUsedAt: undefined,
   }));
 }
+
+export { retainLocalHostLastConnectedAt, sanitizeHostsForSync };
 
 export function getEffectivePortForwardingRulesForSync(
   rules: PortForwardingRule[] | undefined,
@@ -568,8 +577,10 @@ export function collectSyncableSettings(): SyncPayload['settings'] {
   // externalAgents intentionally not collected: command/args/env are device-local.
   const defaultAgentId = localStorageAdapter.readString(STORAGE_KEY_AI_DEFAULT_AGENT);
   if (defaultAgentId != null) ai.defaultAgentId = defaultAgentId;
-  const commandBlocklist = localStorageAdapter.read<string[]>(STORAGE_KEY_AI_COMMAND_BLOCKLIST);
-  if (Array.isArray(commandBlocklist)) ai.commandBlocklist = commandBlocklist;
+  const storedCommandBlocklist = localStorageAdapter.read<string[]>(STORAGE_KEY_AI_COMMAND_BLOCKLIST);
+  if (Array.isArray(storedCommandBlocklist)) {
+    ai.commandBlocklist = readCommandBlocklistSetting();
+  }
   const commandTimeout = localStorageAdapter.readNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT);
   if (commandTimeout != null && Number.isFinite(commandTimeout)) ai.commandTimeout = commandTimeout;
   const responseIdleTimeout = localStorageAdapter.readNumber(STORAGE_KEY_AI_RESPONSE_IDLE_TIMEOUT);
@@ -820,7 +831,9 @@ async function applySyncableSettings(settings: NonNullable<SyncPayload['settings
     // externalAgents intentionally not applied: device-local. Legacy snapshots
     // that still carry an `externalAgents` field are silently ignored.
     if (ai.defaultAgentId != null) localStorageAdapter.writeString(STORAGE_KEY_AI_DEFAULT_AGENT, ai.defaultAgentId);
-    if (ai.commandBlocklist != null) localStorageAdapter.write(STORAGE_KEY_AI_COMMAND_BLOCKLIST, ai.commandBlocklist);
+    if (ai.commandBlocklist != null) {
+      persistCommandBlocklistSetting(migrateLegacyCommandBlocklist(ai.commandBlocklist));
+    }
     if (ai.commandTimeout != null) localStorageAdapter.writeNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT, ai.commandTimeout);
     if (ai.responseIdleTimeout != null) {
       localStorageAdapter.writeNumber(STORAGE_KEY_AI_RESPONSE_IDLE_TIMEOUT, ai.responseIdleTimeout);
@@ -951,7 +964,7 @@ export function buildSyncPayload(
   portForwardingRules?: PortForwardingRule[],
 ): SyncPayload {
   return {
-    hosts: vault.hosts,
+    hosts: sanitizeHostsForSync(vault.hosts),
     keys: vault.keys,
     identities: vault.identities,
     proxyProfiles: vault.proxyProfiles,
@@ -1036,7 +1049,7 @@ export async function buildCloudSyncPayload(
   },
 ): Promise<SyncPayload> {
   const base: SyncPayload = {
-    hosts: vault.hosts,
+    hosts: sanitizeHostsForSync(vault.hosts),
     keys: vault.keys,
     identities: vault.identities,
     proxyProfiles: vault.proxyProfiles,
@@ -1062,6 +1075,8 @@ export function buildLocalVaultPayload(
 ): SyncPayload {
   const base: SyncPayload = {
     ...buildSyncPayload(vault, portForwardingRules),
+    // Keep device-local recent-connection timestamps in protective backups.
+    hosts: vault.hosts,
     settings: collectLocalBackupSettings(),
     knownHosts: vault.knownHosts,
   };
@@ -1128,6 +1143,7 @@ function applyPayload(
   options: {
     includeLocalOnlyData: boolean;
     applyPluginSidecars?: PluginSyncSidecarApplier;
+    currentHosts?: Host[];
   },
 ): Promise<void> {
   // Portable payloads must never keep device-bound enc:v1 blobs. Strip them
@@ -1135,10 +1151,14 @@ function applyPayload(
   // shells and let the user re-enter secrets (#2702).
   const sanitizedPayload = stripSyncPayloadEncryptedCredentials(payload);
   const legacyLineTimestampsEnabled = sanitizedPayload.settings?.terminalSettings?.showLineTimestamps === true;
+  let hosts = migrateHostsFromLegacyLineTimestamps(sanitizedPayload.hosts, legacyLineTimestampsEnabled);
+  if (!options.includeLocalOnlyData) {
+    hosts = retainLocalHostLastConnectedAt(hosts, options.currentHosts) ?? hosts;
+  }
   // Build the vault import object. Cloud sync intentionally ignores
   // local-only trust records even if legacy cloud snapshots still carry them.
   const vaultImport: Record<string, unknown> = {
-    hosts: migrateHostsFromLegacyLineTimestamps(sanitizedPayload.hosts, legacyLineTimestampsEnabled),
+    hosts,
     keys: sanitizedPayload.keys,
     identities: sanitizedPayload.identities,
     proxyProfiles: sanitizedPayload.proxyProfiles,
@@ -1192,11 +1212,13 @@ export function applySyncPayload(
   importers: SyncPayloadImporters,
   options?: {
     applyPluginSidecars?: PluginSyncSidecarApplier;
+    currentHosts?: Host[];
   },
 ): Promise<void> {
   return applyPayload(payload, importers, {
     includeLocalOnlyData: false,
     applyPluginSidecars: options?.applyPluginSidecars,
+    currentHosts: options?.currentHosts,
   });
 }
 

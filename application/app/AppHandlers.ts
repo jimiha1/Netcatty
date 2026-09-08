@@ -551,15 +551,35 @@ export async function splitSessionWithCurrentShellImpl(getCtx: AppContextGetter,
   });
 }
 
-export async function copySessionWithCurrentShellImpl(getCtx: AppContextGetter, sessionId: string) {
-  const { classifyLocalShellType, copySession, discoveredShells, resolveShellSetting, terminalSettings } = getCtx();
+export async function copySessionWithCurrentShellImpl(
+  getCtx: AppContextGetter,
+  sessionId: string,
+  options?: { reuseConnection?: boolean },
+) {
+  const { classifyLocalShellType, copySession, discoveredShells, resolveShellSetting, sessions, terminalSettings } = getCtx();
   const resolved = resolveShellSetting(terminalSettings.localShell, discoveredShells);
-  const inheritedCwd = await captureCtxInheritedCwd(getCtx, sessionId);
+  // A fresh remote login may stop at a bastion's host-selection prompt. Do
+  // not probe the old target or send its directory command to the new login.
+  // Local duplicates still open in the source terminal's current directory.
+  const inheritCwd = options?.reuseConnection !== false
+    || sessions?.find((session: { id: string }) => session.id === sessionId)?.protocol === "local";
+  const inheritedCwd = inheritCwd ? await captureCtxInheritedCwd(getCtx, sessionId) : undefined;
   const userAgent = typeof navigator !== 'undefined' ? navigator.userAgent : '';
   return copySession(sessionId, {
     localShellType: classifyLocalShellType(resolved?.command || terminalSettings.localShell, userAgent),
     inheritedCwd,
+    reuseConnection: options?.reuseConnection,
   });
+}
+
+/**
+ * "Duplicate session": clone the tab but open a brand-new connection instead of
+ * multiplexing over the source's established SSH channel (fresh auth; with a
+ * bastion/jump host this restarts the bastion login so the user can pick a new
+ * target host).
+ */
+export async function duplicateSessionWithCurrentShellImpl(getCtx: AppContextGetter, sessionId: string) {
+  return copySessionWithCurrentShellImpl(getCtx, sessionId, { reuseConnection: false });
 }
 
 export async function copyWorkspaceWithCurrentShellImpl(getCtx: AppContextGetter, workspaceId: string) {
@@ -702,7 +722,7 @@ export async function closeTabsBatchImpl(getCtx: AppContextGetter, targetIds: st
 }
 
 export function executeHotkeyActionImpl(getCtx: AppContextGetter, action: string, e: KeyboardEvent) {
-  const { IS_DEV, MOVE_FOCUS_DEBOUNCE_MS, activeTabStore, addConnectionLogRef, closePluginViewTab, closeSession, closeTabInFlightRef, closeWorkspace, collectSessionIds, confirmIfBusyLocalTerminal, createLocalTerminalWithCurrentShell, editorTabs, fromEditorTabId, handleOpenSettingsRef, handleRequestCloseEditorTabRef, isEditorTabId, isPluginViewTabId, isQuickSwitcherOpen, lastMoveFocusTimeRef, moveFocusInWorkspace, orderedTabs, resolveCloseIntent, resolveSnippetsShortcutIntent, sessions, setActiveTabId, setAddToWorkspaceDialog, setIsQuickSwitcherOpen, setNavigateToSection, settings, sftpPaneMagnificationRef, splitSessionWithCurrentShell, systemInfoRef, terminalPaneMagnificationRef, toEditorTabId, toggleBroadcast, cycleSidePanelToolRef, toggleScriptsSidePanelRef, toggleSidePanelRef, workspaces } = getCtx();
+  const { IS_DEV, MOVE_FOCUS_DEBOUNCE_MS, activeTabStore, addConnectionLogRef, canUseGlobalBroadcast, closePluginViewTab, closeSession, closeTabInFlightRef, closeWorkspace, collectSessionIds, confirmIfBusyLocalTerminal, createLocalTerminalWithCurrentShell, editorTabs, fromEditorTabId, handleOpenSettingsRef, handleRequestCloseEditorTabRef, isEditorTabId, isPluginViewTabId, isQuickSwitcherOpen, lastMoveFocusTimeRef, moveFocusInWorkspace, orderedTabs, resolveCloseIntent, resolveSnippetsShortcutIntent, sessions, setActiveTabId, setAddToWorkspaceDialog, setIsQuickSwitcherOpen, setNavigateToSection, settings, sftpPaneMagnificationRef, splitSessionWithCurrentShell, systemInfoRef, terminalPaneMagnificationRef, toEditorTabId, toggleBroadcast, cycleSidePanelToolRef, toggleGlobalBroadcast, toggleScriptsSidePanelRef, toggleSidePanelRef, workspaces } = getCtx();
 {
     const shortcutTabs = buildNumberShortcutTabTargets({
       showSftpTab: settings.showSftpTab ?? true,
@@ -902,11 +922,16 @@ export function executeHotkeyActionImpl(getCtx: AppContextGetter, action: string
         cycleSidePanelToolRef.current?.('prev');
         break;
       case 'broadcast': {
-        // Toggle broadcast mode for the active workspace
+        // Workspace tabs keep their local broadcast state; orphan tabs share
+        // the global state when at least two visible orphan tabs exist.
         const currentId = activeTabStore.getActiveTabId();
         const activeWs = workspaces.find(w => w.id === currentId);
         if (activeWs) {
           toggleBroadcast(activeWs.id);
+        } else if (sessions.some((session: TerminalSession) => (
+          session.id === currentId && !session.workspaceId
+        )) && canUseGlobalBroadcast) {
+          toggleGlobalBroadcast();
         }
         break;
       }
