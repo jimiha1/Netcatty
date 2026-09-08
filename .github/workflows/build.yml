@@ -730,12 +730,26 @@ jobs:
           # Release file — package selection and signing stay verified.
           apt-get -o Acquire::Retries=4 -o Acquire::Check-Valid-Until=false update
           apt-get -o Acquire::Retries=4 -o Acquire::Check-Valid-Until=false install -y curl build-essential python3 git libfuse2 file rpm \
-            libarchive-tools \
+            libarchive-tools xz-utils \
             libglib2.0-0 libgtk-3-0 libnss3 libxss1 libxtst6 libasound2 \
             libatk-bridge2.0-0 libdrm2 libgbm1 libx11-xcb1 libxcb-dri3-0
-          curl -fsSL --retry 4 --retry-all-errors --connect-timeout 20 --max-time 300 \
-            https://deb.nodesource.com/setup_22.x | bash -
-          apt-get -o Acquire::Retries=4 -o Acquire::Check-Valid-Until=false install -y nodejs
+          # NodeSource no longer serves bullseye (post-LTS): apt silently fell
+          # back to Debian's nodejs 12, which ships no npm. Install the official
+          # Node 22 linux-arm64 tarball instead (same approach as linux-x64).
+          NODE_VERSION="$(curl -fsSL --retry 4 --retry-connrefused --connect-timeout 20 --max-time 300 \
+            https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
+            | awk '/node-v[0-9.]+-linux-arm64\.tar\.xz$/{print $2; exit}' \
+            | sed -E 's/^node-(v[0-9.]+)-linux-arm64\.tar\.xz$/\1/')"
+          if [[ -z "${NODE_VERSION}" ]]; then
+            echo "::error::Could not resolve latest Node 22 linux-arm64 tarball version."
+            exit 1
+          fi
+          echo "Installing Node ${NODE_VERSION} from nodejs.org"
+          curl -fsSL --retry 4 --retry-connrefused --connect-timeout 20 --max-time 300 \
+            "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-arm64.tar.xz" \
+            | tar -xJ -C /usr/local --strip-components=1
+          node -v
+          npm -v
 
       - name: Checkout
         uses: actions/checkout@v7
