@@ -1,5 +1,6 @@
 export type SidePanelTool =
   | 'sftp'
+  | 'browser'
   | 'scripts'
   | 'history'
   | 'theme'
@@ -248,4 +249,17 @@ export function resizeSidePanelSplit(
 
   const root = patch(layout.root);
   return root === layout.root ? layout : { ...layout, root };
+}
+
+export type SidePanelDockPosition = 'left' | 'right' | 'bottom';
+
+export const SIDE_PANEL_DOCK_POSITIONS: readonly SidePanelDockPosition[] = [
+  'left',
+  'right',
+  'bottom',
+];
+
+export function isSidePanelDockPosition(value: unknown): value is SidePanelDockPosition {
+  return typeof value === 'string'
+    && (SIDE_PANEL_DOCK_POSITIONS as readonly string[]).includes(value);
 }

@@ -113,6 +113,12 @@ export type SnippetExecutor = (
     multiLineRunMode?: Snippet["multiLineRunMode"];
     /** When false, do not steal keyboard focus (multi-tab fan-out). Default true. */
     focus?: boolean;
+    /**
+     * Force sensitive classification on the target's own write (bypassed
+     * password fan-out, #3488): the peer has not necessarily classified its
+     * own prompt as sensitive, so it must keep input interceptors skipped.
+     */
+    sensitive?: boolean;
   },
   /**
    * Returns true when the command was written to the session. False means the
@@ -578,6 +584,7 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
                     addDraftFiles={aiConfig.addDraftFiles}
                     removeDraftFile={aiConfig.removeDraftFile}
                     createSession={aiConfig.createSession}
+                    undoLastTurnInSession={aiConfig.undoLastTurnInSession}
                     deleteSession={aiConfig.deleteSession}
                     updateSessionTitle={aiConfig.updateSessionTitle}
                     updateSessionExternalSessionId={aiConfig.updateSessionExternalSessionId}
@@ -585,6 +592,7 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
                     updateLastMessage={aiConfig.updateLastMessage}
                     updateMessageById={aiConfig.updateMessageById}
                     persistContextCompaction={aiConfig.persistContextCompaction}
+                    forkSessionFromMessage={aiConfig.forkSessionFromMessage}
                     providers={aiConfig.providers}
                     activeProviderId={aiConfig.activeProviderId}
                     activeModelId={aiConfig.activeModelId}
@@ -687,6 +695,7 @@ export interface TerminalLayerProps {
   onAddKnownHost?: (knownHost: KnownHost) => void;
   onCommandExecuted?: (command: string, hostId: string, hostLabel: string, sessionId: string) => void;
   onDeleteShellHistoryEntry?: (entryId: string) => void;
+  onClearCommandHistory?: () => void;
   onTerminalDataCapture?: (sessionId: string, data: string) => void;
   onCreateWorkspaceFromSessions: (baseSessionId: string, joiningSessionId: string, hint: Exclude<SplitHint, null>) => void;
   onAddSessionToWorkspace: (workspaceId: string, sessionId: string, hint: Exclude<SplitHint, null>) => void;
@@ -726,6 +735,8 @@ export interface TerminalLayerProps {
   sftpAutoOpenSidebar: boolean;
   terminalSidePanelAutoOpen?: boolean;
   terminalSidePanelAutoOpenTab?: TerminalSidePanelAutoOpenTab;
+  localShellSidePanelAutoOpen?: boolean;
+  localShellSidePanelAutoOpenTab?: TerminalSidePanelAutoOpenTab;
   sftpFollowTerminalCwd: boolean;
   setSftpFollowTerminalCwd: (enabled: boolean) => void;
   editorWordWrap: boolean;
@@ -803,7 +814,7 @@ interface TerminalPaneProps {
   onOpenTheme: () => void;
   onOpenSystem?: () => void;
   onCloseSession: (sessionId: string) => void;
-  onStatusChange: (sessionId: string, status: TerminalSession['status']) => void;
+  onStatusChange: (sessionId: string, status: TerminalSession['status'], sftpHost?: Host) => void;
   onSessionExit: (sessionId: string, evt: TerminalSessionExitEvent) => void;
   onTerminalDataCapture?: (sessionId: string, data: string) => void;
   onOsDetected: (hostId: string, distro: string) => void;
@@ -1705,7 +1716,7 @@ interface TerminalPanesHostProps {
   onOpenTheme: () => void;
   onOpenSystem?: () => void;
   onCloseSession: (sessionId: string) => void;
-  onStatusChange: (sessionId: string, status: TerminalSession['status']) => void;
+  onStatusChange: (sessionId: string, status: TerminalSession['status'], sftpHost?: Host) => void;
   onSessionExit: (sessionId: string, evt: TerminalSessionExitEvent) => void;
   onTerminalDataCapture?: (sessionId: string, data: string) => void;
   onOsDetected: (hostId: string, distro: string) => void;

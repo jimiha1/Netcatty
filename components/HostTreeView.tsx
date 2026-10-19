@@ -1,3 +1,4 @@
+import { compareHostAddresses } from "../domain/hostAddressSort";
 import { CheckSquare, Edit2, FileSymlink, Server, Square, Expand, Minimize2 } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -15,6 +16,7 @@ import {
   type HostClickBehavior,
 } from '../domain/hostClickBehavior';
 import { sortByVaultOrder } from '../domain/vaultOrder';
+import { getVaultHostRowSubtitle } from '../domain/localShellHost';
 import { STORAGE_KEY_VAULT_HOSTS_TREE_EXPANDED } from '../infrastructure/config/storageKeys';
 import { GroupConfig, GroupNode, Host } from '../types';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible';
@@ -39,7 +41,7 @@ const getTreeGroupDropIntent = (
 const hasDragType = (dataTransfer: DataTransfer, type: string) =>
   Array.from(dataTransfer.types).includes(type);
 
-type HostTreeSortMode = 'manual' | 'az' | 'za' | 'newest' | 'oldest' | 'group';
+type HostTreeSortMode = 'manual' | 'az' | 'za' | 'newest' | 'oldest' | 'group' | 'ip';
 
 export type VisibleHostTreeItem =
   | {
@@ -90,6 +92,7 @@ const sortHostTreeHosts = (hosts: Host[], sortMode: HostTreeSortMode): Host[] =>
     if (sortMode === 'newest') return (b.createdAt || 0) - (a.createdAt || 0);
     if (sortMode === 'oldest') return (a.createdAt || 0) - (b.createdAt || 0);
     if (sortMode === 'manual') return 0;
+    if (sortMode === 'ip') return compareHostAddresses(a.hostname, b.hostname) || a.label.localeCompare(b.label);
     return a.label.localeCompare(b.label);
   });
   return sortMode === 'manual' ? sortByVaultOrder(sorted) : sorted;
@@ -279,6 +282,7 @@ interface HostTreeViewProps {
   onExpandAll?: (paths: string[]) => void;
   onCollapseAll?: () => void;
   onConnect: (host: Host) => void;
+  onOpenBrowser?: (host: Host) => void;
   onEditHost: (host: Host) => void;
   onDuplicateHost: (host: Host) => void;
   onDeleteHost: (host: Host) => void;
@@ -319,6 +323,7 @@ interface TreeNodeProps {
   expandedPaths: Set<string>;
   onToggle: (path: string) => void;
   onConnect: (host: Host) => void;
+  onOpenBrowser?: (host: Host) => void;
   onEditHost: (host: Host) => void;
   onDuplicateHost: (host: Host) => void;
   onDeleteHost: (host: Host) => void;
@@ -365,6 +370,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
   expandedPaths,
   onToggle,
   onConnect,
+  onOpenBrowser,
   onEditHost,
   onDuplicateHost,
   onDeleteHost,
@@ -538,19 +544,24 @@ const TreeNode: React.FC<TreeNodeProps> = ({
                     ? <CheckSquare size={16} />
                     : <Square size={16} />
                   : undefined}
-                labelActions={!isMultiSelectMode && (
-                  <button
-                    aria-label={`Edit ${node.name}`}
-                    tabIndex={-1}
-                    data-host-tree-group-edit-button={node.path}
-                    className="flex h-5 w-5 shrink-0 items-center justify-center rounded opacity-0 transition-colors hover:bg-secondary/80 group-hover:opacity-100"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onEditGroup(node.path);
-                    }}
-                  >
-                    <Edit2 size={12} />
-                  </button>
+                labelActions={(
+                  <span className="inline-flex items-center gap-1">
+                    <HostNotesIndicator notes={groupConfigs.find((config) => config.path === node.path)?.notes} label="Group notes" />
+                    {!isMultiSelectMode && (
+                      <button
+                        aria-label={`Edit ${node.name}`}
+                        tabIndex={-1}
+                        data-host-tree-group-edit-button={node.path}
+                        className="flex h-5 w-5 shrink-0 items-center justify-center rounded opacity-0 transition-colors hover:bg-secondary/80 group-hover:opacity-100"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onEditGroup(node.path);
+                        }}
+                      >
+                        <Edit2 size={12} />
+                      </button>
+                    )}
+                  </span>
                 )}
               />
             </CollapsibleTrigger>
@@ -576,6 +587,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               expandedPaths={expandedPaths}
               onToggle={onToggle}
               onConnect={onConnect}
+              onOpenBrowser={onOpenBrowser}
               onEditHost={onEditHost}
               onDuplicateHost={onDuplicateHost}
               onDeleteHost={onDeleteHost}
@@ -619,6 +631,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               host={host}
               depth={depth + 1}
               onConnect={onConnect}
+              onOpenBrowser={onOpenBrowser}
               onEditHost={onEditHost}
               onDuplicateHost={onDuplicateHost}
               onDeleteHost={onDeleteHost}
@@ -652,6 +665,7 @@ interface HostTreeItemProps {
   host: Host;
   depth: number;
   onConnect: (host: Host) => void;
+  onOpenBrowser?: (host: Host) => void;
   onEditHost: (host: Host) => void;
   onDuplicateHost: (host: Host) => void;
   onDeleteHost: (host: Host) => void;
@@ -698,6 +712,7 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
   host,
   depth,
   onConnect,
+  onOpenBrowser,
   onEditHost,
   onDuplicateHost,
   onDeleteHost,
@@ -719,6 +734,7 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
   initialTreeItemKey,
   onActiveTreeItemChange,
 }) => {
+  const { t } = useI18n();
   const safeHost = sanitizeHost(host);
   const tags = host.tags || [];
   const displayDetails = useMemo(
@@ -836,7 +852,9 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
                 <HostNotesIndicator notes={host.notes} />
               </div>
               <div className="truncate text-[11px] leading-4 text-muted-foreground">
-                {displayUsername}@{host.hostname}:{displayPort}
+                {displayProtocol === 'local'
+                  ? getVaultHostRowSubtitle(safeHost, { localFallback: t('localShell.subtitle') })
+                  : `${displayUsername}@${host.hostname}:${displayPort}`}
               </div>
             </div>
           )}
@@ -860,6 +878,7 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
       <HostTreeHostContextMenuContent
         host={host}
         onConnect={onConnect}
+        onOpenBrowser={onOpenBrowser}
         onEditHost={onEditHost}
         onDuplicateHost={onDuplicateHost}
         onCopyHostname={onCopyHostname}
@@ -879,6 +898,7 @@ const HostTreeViewInner: React.FC<HostTreeViewProps> = ({
   onExpandAll: externalOnExpandAll,
   onCollapseAll: externalOnCollapseAll,
   onConnect,
+  onOpenBrowser,
   onEditHost,
   onDuplicateHost,
   onDeleteHost,
@@ -1188,6 +1208,7 @@ const HostTreeViewInner: React.FC<HostTreeViewProps> = ({
                 expandedPaths={expandedPaths}
                 onToggle={togglePath}
                 onConnect={onConnect}
+                onOpenBrowser={onOpenBrowser}
                 onEditHost={onEditHost}
                 onDuplicateHost={onDuplicateHost}
                 onDeleteHost={onDeleteHost}
@@ -1229,6 +1250,7 @@ const HostTreeViewInner: React.FC<HostTreeViewProps> = ({
                 host={item.host}
                 depth={item.depth}
                 onConnect={onConnect}
+                onOpenBrowser={onOpenBrowser}
                 onEditHost={onEditHost}
                 onDuplicateHost={onDuplicateHost}
                 onDeleteHost={onDeleteHost}
@@ -1278,6 +1300,7 @@ function hostTreeViewAreEqual(prev: HostTreeViewProps, next: HostTreeViewProps):
     && prev.onExpandAll === next.onExpandAll
     && prev.onCollapseAll === next.onCollapseAll
     && prev.onConnect === next.onConnect
+    && prev.onOpenBrowser === next.onOpenBrowser
     && prev.onEditHost === next.onEditHost
     && prev.onDuplicateHost === next.onDuplicateHost
     && prev.onDeleteHost === next.onDeleteHost

@@ -2,8 +2,10 @@
 // Module-level require on purpose: code inside registerCattyExecHandlers
 // runs under `with (ctx)` where bare `require` resolves to ctx.require
 // (based in electron/bridges/). Requiring here keeps the path unambiguous.
+const { emitTerminalSessionData } = require("../emitTerminalSessionData.cjs");
 const { formatSyntheticEcho } = require("../ai/shellUtils.cjs");
-const { ensureSessionShellKindForExec } = require("../ai/sessionShellKind.cjs");
+const { clearSessionFlowState } = require("../terminalFlowAck.cjs");
+const { remoteDisallowsExecChannelProbe, sessionDisallowsExtraSshChannel, ensureSessionShellKindForExec } = require("../ai/sessionShellKind.cjs");
 
 function getWorkerExecutionMeta(mcpServerBridge, sessionId, chatSessionId) {
   return mcpServerBridge.getSessionMeta?.(sessionId, chatSessionId) || {};
@@ -171,15 +173,22 @@ function registerCattyExecHandlers(ctx) {
             return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
           }
           return execViaPty(ptyStream, command, {
+            onInterrupt: () => clearSessionFlowState(session),
             stripMarkers: true,
             trackForCancellation: mcpServerBridge.activePtyExecs,
             timeoutMs,
             shellKind: session.shellKind,
             loginShellHint: session._loginShellKind,
             probeLiveShell: true,
+            bastionKeystrokes: remoteDisallowsExecChannelProbe(session.remoteSshVersion),
+            skipPendingInputClear: session.singleChannelSsh === true,
             onProbeAborted: (marker) => {
               const contents = electronModule?.webContents?.fromId?.(session.webContentsId);
-              safeSend(contents, "netcatty:data", { sessionId, data: `${marker}_R\n` });
+              emitTerminalSessionData(contents, sessionId, `${marker}_R\n`, { session });
+            },
+            onEchoSuppressionPrime: (marker) => {
+              const contents = electronModule?.webContents?.fromId?.(session.webContentsId);
+              emitTerminalSessionData(contents, sessionId, `${marker}_I\n`, { session });
             },
             chatSessionId,
             expectedPrompt: getFreshIdlePrompt(session),
@@ -208,7 +217,7 @@ function registerCattyExecHandlers(ctx) {
 
       // Fallback: SSH exec channel (invisible to terminal)
       const sshClient = session.sshClient || session.conn;
-      if (sshClient && typeof sshClient.exec === "function") {
+      if (!session.singleChannelSsh && sshClient && typeof sshClient.exec === "function") {
         const { execViaChannel } = require("./ai/ptyExec.cjs");
         const channelTimeoutMs = mcpServerBridge.getCommandTimeoutMs ? mcpServerBridge.getCommandTimeoutMs() : 60000;
         return withLockRelease(async () => {

@@ -51,6 +51,7 @@ import { useStoredString } from "../application/state/useStoredString";
 import type { VaultLockHandle } from "../application/state/vaultManagedImportLock";
 import { useTreeExpandedState } from "../application/state/useTreeExpandedState";
 import { useVaultGroupDeletion } from "../application/state/useVaultGroupDeletion";
+import { useVaultHostDeletion } from "../application/state/useVaultHostDeletion";
 import type { VaultHostPersistenceResult } from "../application/state/vaultImportProgress";
 import type {
   VaultGroupMutationResult,
@@ -73,10 +74,13 @@ import {
   upsertHostById,
 } from "../domain/host";
 import { exportHostsToCsvWithStats } from "../domain/vaultImport";
+import { saveWorkSurfaceHostDraft, type WorkSurfaceHostEditorTarget } from "../application/state/useWorkSurfaceHostEditor";
+import { upsertKnownHost } from "../domain/knownHosts";
 import {
   remapSnippetTargetGroupPaths,
 } from "../domain/hostGroupPathMutations";
 import {
+  canReorderVaultHosts,
   reorderVaultItems,
   reorderVaultStrings,
   type VaultOrderPosition,
@@ -166,6 +170,7 @@ const SnippetsManager = lazy(() => import("./SnippetsManager"));
 
 export type VaultSection =
   | "hosts"
+  | "monitor"
   | "keys"
   | "proxies"
   | "snippets"
@@ -207,7 +212,8 @@ const isSortMode = (value: string): value is SortMode =>
   value === "za" ||
   value === "newest" ||
   value === "oldest" ||
-  value === "group";
+  value === "group" ||
+  value === "ip";
 
 // Props without isActive - it's now subscribed internally
 interface VaultViewProps {
@@ -235,7 +241,9 @@ interface VaultViewProps {
   onDeleteHost: (id: string) => void;
   onConnect: (host: Host) => void;
   onOpenHostFromNote?: (host: Host, source?: { noteId: string }) => void;
-  onUpdateHosts: (hosts: Host[]) => VaultHostPersistenceResult | Promise<VaultHostPersistenceResult>;
+  onUpdateHosts: (
+    hosts: Host[] | ((prev: Host[]) => Host[]),
+  ) => VaultHostPersistenceResult | Promise<VaultHostPersistenceResult>;
   onReadPersistedHosts: () => Promise<Host[]>;
   onUpdateKeys: (keys: SSHKey[]) => void;
   onImportOrReuseKey: (draft: Partial<SSHKey>) => SSHKey;
@@ -455,6 +463,9 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   const [isHostPanelOpen, setIsHostPanelOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<Host | null>(null);
   const [newHostGroupPath, setNewHostGroupPath] = useState<string | null>(null);
+  // Local shell (CMD) host panel state — a vault host entry with protocol 'local'
+  const [isLocalShellHostPanelOpen, setIsLocalShellHostPanelOpen] = useState(false);
+  const [editingLocalShellHost, setEditingLocalShellHost] = useState<Host | null>(null);
   const [pendingOpenNoteId, setPendingOpenNoteId] = useState<string | null>(
     null,
   );
@@ -470,8 +481,17 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     setCurrentSection("hosts");
     setSelectedGroupPath(null);
     setNewHostGroupPath(null);
-    setEditingHost(deepLinkHostDraft);
-    setIsHostPanelOpen(true);
+    if (deepLinkHostDraft.protocol === "local") {
+      setEditingHost(null);
+      setIsHostPanelOpen(false);
+      setEditingLocalShellHost(deepLinkHostDraft);
+      setIsLocalShellHostPanelOpen(true);
+    } else {
+      setIsLocalShellHostPanelOpen(false);
+      setEditingLocalShellHost(null);
+      setEditingHost(deepLinkHostDraft);
+      setIsHostPanelOpen(true);
+    }
     onDeepLinkHostDraftHandled?.();
   }, [deepLinkHostDraft, onDeepLinkHostDraftHandled]);
 
@@ -504,17 +524,17 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   useEffect(() => {
     const currentIds = new Set(hosts.map((h) => h.id));
     // Check against previous IDs before updating the ref
-    if (
-      editingHost &&
-      knownHostIdsRef.current.has(editingHost.id) &&
-      !currentIds.has(editingHost.id)
-    ) {
+    const editingDeleted = (openHost: Host | null) =>
+      Boolean(openHost && knownHostIdsRef.current.has(openHost.id) && !currentIds.has(openHost.id));
+    if (editingDeleted(editingHost) || editingDeleted(editingLocalShellHost)) {
       setIsHostPanelOpen(false);
       setEditingHost(null);
+      setIsLocalShellHostPanelOpen(false);
+      setEditingLocalShellHost(null);
       setNewHostGroupPath(null);
     }
     knownHostIdsRef.current = currentIds;
-  }, [hosts, editingHost]);
+  }, [hosts, editingHost, editingLocalShellHost]);
 
   // Group panel state
   const [isGroupPanelOpen, setIsGroupPanelOpen] = useState(false);
@@ -596,8 +616,12 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
             {},
             { validProxyProfileIds: proxyProfileIdSet },
           );
-      // Only prompt when Telnet is available but isn't the host's default protocol.
-      if (effective.telnetEnabled && effective.protocol !== "telnet") {
+      // Only prompt when Telnet is available but isn't the host's default
+      // protocol, and only for SSH hosts: local-shell and serial hosts must
+      // always launch their own transport, never an inherited group Telnet
+      // flag. Hosts without an explicit protocol are legacy SSH entries.
+      const effectiveProtocol = effective.protocol ?? "ssh";
+      if (effectiveProtocol === "ssh" && effective.telnetEnabled) {
         setProtocolSelectHost(effective);
       } else if (effective.protocol === "telnet") {
         // Telnet-as-default wins over a stray moshEnabled flag.
@@ -651,16 +675,77 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     setIsGroupPanelOpen(false);
     setEditingGroupPath(null);
     setEditingHost(null);
+    setIsLocalShellHostPanelOpen(false);
+    setEditingLocalShellHost(null);
     setNewHostGroupPath(null);
     setIsHostPanelOpen(true);
   }, []);
 
+  // "Local shell (CMD)" entry under the New Host menu — opens the dedicated
+  // local-shell host editor with the current vault group preselected.
+  const handleNewLocalShellHost = useCallback(() => {
+    setIsGroupPanelOpen(false);
+    setEditingGroupPath(null);
+    setEditingHost(null);
+    setIsHostPanelOpen(false);
+    setEditingLocalShellHost(null);
+    setNewHostGroupPath(null);
+    setIsLocalShellHostPanelOpen(true);
+  }, []);
+
+  const handleCancelLocalShellHost = useCallback(() => {
+    setIsLocalShellHostPanelOpen(false);
+    setEditingLocalShellHost(null);
+  }, []);
+
+  const handleSaveLocalShellHost = useCallback((host: Host, connectNow?: boolean) => {
+    // A duplicated local host carries a freshly generated ID that is not in the
+    // vault yet, so it must be saved as a new entry (edit mode would no-op).
+    // (Note: the mode is derived from the rendered hosts snapshot only, so the
+    // updater below can still merge against the up-to-date vault array.)
+    const editingExistingHost = hosts.some((entry) => entry.id === editingLocalShellHost?.id);
+    const target: WorkSurfaceHostEditorTarget = editingExistingHost && editingLocalShellHost
+      ? { mode: "edit", openedHost: editingLocalShellHost, requestId: 0 }
+      : { mode: "new", defaultGroup: null, requestId: 0 };
+    // Apply the draft against the freshest host array, not the one captured at
+    // render time: another vault write (terminal metadata, sync) may have
+    // updated hostsRef between render and Save, and submitting the captured
+    // array would replace it wholesale.
+    let savedHost: Host | null = null;
+    onUpdateHosts((prevHosts) => {
+      const updatedHosts = saveWorkSurfaceHostDraft(prevHosts, target, host);
+      if (!updatedHosts) return prevHosts;
+      savedHost = updatedHosts.find((entry) => entry.id === host.id) ?? null;
+      return updatedHosts;
+    });
+    setIsLocalShellHostPanelOpen(false);
+    setEditingLocalShellHost(null);
+    if (connectNow && savedHost) onConnect(savedHost);
+  }, [hosts, editingLocalShellHost, onConnect, onUpdateHosts]);
+
   const handleEditHost = useCallback((host: Host) => {
     setIsGroupPanelOpen(false);
     setEditingGroupPath(null);
+    // Local shell hosts route to their dedicated editor (no SSH auth fields).
+    if (host.protocol === "local") {
+      setEditingHost(null);
+      setIsHostPanelOpen(false);
+      setEditingLocalShellHost(host);
+      setIsLocalShellHostPanelOpen(true);
+      return;
+    }
+    setIsLocalShellHostPanelOpen(false);
+    setEditingLocalShellHost(null);
     setEditingHost(host);
     setIsHostPanelOpen(true);
   }, []);
+
+  const handleAddKnownHost = useCallback(
+    (kh: KnownHost) => {
+      onUpdateKnownHosts(upsertKnownHost(knownHosts, kh));
+    },
+    [knownHosts, onUpdateKnownHosts],
+  );
 
   const handleDuplicateHost = useCallback(
     (host: Host) => {
@@ -677,6 +762,15 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         lastConnectedAt: undefined,
       };
       // Open the edit panel with the duplicated host for modification
+      if (duplicatedHost.protocol === "local") {
+        setEditingHost(null);
+        setIsHostPanelOpen(false);
+        setEditingLocalShellHost(duplicatedHost);
+        setIsLocalShellHostPanelOpen(true);
+        return;
+      }
+      setEditingLocalShellHost(null);
+      setIsLocalShellHostPanelOpen(false);
       setEditingHost(duplicatedHost);
       setIsHostPanelOpen(true);
     },
@@ -696,12 +790,15 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       keyPassphrases,
       unreadablePassphraseCount,
     } = await buildVaultCsvCredentialOptions(hosts, keys);
-    const { csv, exportedCount, skippedCount } = exportHostsToCsvWithStats(
+    const { csv, exportedCount, skippedCount, unreadableProxyCredentialCount } = exportHostsToCsvWithStats(
       hosts,
       {
         keyPassphrases,
         keyPassphrasesById,
         keyPathsById,
+        proxyProfiles,
+        identities,
+        groupConfigs,
       },
     );
 
@@ -727,6 +824,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         }),
       );
     }
+    if (unreadableProxyCredentialCount > 0) {
+      toast.warning(
+        t("vault.hosts.export.toast.proxyCredentialsSkipped", {
+          count: unreadableProxyCredentialCount,
+        }),
+      );
+    }
     if (skippedCount > 0) {
       toast.warning(
         t("vault.hosts.export.toast.successWithSkipped", {
@@ -739,7 +843,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         t("vault.hosts.export.toast.success", { count: exportedCount }),
       );
     }
-  }, [hosts, keys, t]);
+  }, [hosts, keys, proxyProfiles, identities, groupConfigs, t]);
 
   // Copy hostname/IP for cross-host paste without opening the editor
   const handleCopyHostname = useCallback(
@@ -878,15 +982,19 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     setIsMultiSelectMode(false);
   }, []);
 
-  const deleteSelectedHosts = useCallback(() => {
+  const deleteVaultHosts = useVaultHostDeletion(onCommitVaultGroupMutation);
+  const deleteSelectedHosts = useCallback(async () => {
     if (selectedHostIds.size === 0) return;
-    const updatedHosts = hosts.filter((h) => !selectedHostIds.has(h.id));
-    onUpdateHosts(updatedHosts);
-    clearHostSelection();
-    toast.success(
-      t("vault.hosts.deleteMultiple.success", { count: selectedHostIds.size }),
-    );
-  }, [selectedHostIds, hosts, onUpdateHosts, clearHostSelection, t]);
+    try {
+      await deleteVaultHosts(selectedHostIds);
+      clearHostSelection();
+      toast.success(
+        t("vault.hosts.deleteMultiple.success", { count: selectedHostIds.size }),
+      );
+    } catch {
+      toast.error(t("common.error"));
+    }
+  }, [selectedHostIds, deleteVaultHosts, clearHostSelection, t]);
 
   const connectSelectedHosts = useCallback(() => {
     if (selectedHostIds.size === 0) return;
@@ -1180,34 +1288,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       const source = hostsRef.current.find((host) => host.id === sourceHostId);
       const target = hostsRef.current.find((host) => host.id === targetHostId);
       if (!source || !target) return;
-      const targetGroup = target.group || "";
-      const targetManagedSource = managedSources
-        .filter(
-          (sourceInfo) =>
-            targetGroup === sourceInfo.groupName ||
-            targetGroup.startsWith(`${sourceInfo.groupName}/`),
-        )
-        .sort((a, b) => b.groupName.length - a.groupName.length)[0];
-      const updatedHosts = hostsRef.current.map((host) =>
-        host.id === sourceHostId
-          ? {
-              ...host,
-              label:
-                targetManagedSource &&
-                (!host.protocol || host.protocol === "ssh")
-                  ? host.label.replace(/\s/g, "")
-                  : host.label,
-              group: targetGroup,
-              managedSourceId:
-                targetManagedSource &&
-                (!host.protocol || host.protocol === "ssh")
-                  ? targetManagedSource.id
-                  : undefined,
-            }
-          : host,
-      );
+      // Card-to-card drags only reorder hosts within the same group; moving a
+      // host into a different group must go through the group folder drop
+      // (moveHostToGroup), otherwise dragging two grouped cards past each
+      // other silently swaps their group membership.
+      if (!canReorderVaultHosts(source.group, target.group)) return;
       const reorderedHosts = reorderVaultItems<Host>(
-        updatedHosts,
+        hostsRef.current,
         sourceHostId,
         targetHostId,
         position,
@@ -1216,7 +1303,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       onUpdateHosts(reorderedHosts);
       setSortMode("manual");
     },
-    [managedSources, onUpdateHosts, setSortMode],
+    [onUpdateHosts, setSortMode],
   );
 
   const reorderGroup = useCallback(
@@ -1277,6 +1364,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     handleUnmanageGroup,
     managedGroupPaths,
     moveHostToGroup,
+    moveHostsToGroup,
     setDragOverDropTarget,
     setGroupDragOverDropTarget,
   } = useVaultGroupDragHandlers({
@@ -1287,6 +1375,21 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     onUpdateManagedSources,
     t,
   });
+
+  const managedFilesByGroupPath = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const source of managedSources) {
+      if (source.filePath) {
+        const files = map.get(source.groupName);
+        if (files) {
+          files.push(source.filePath);
+        } else {
+          map.set(source.groupName, [source.filePath]);
+        }
+      }
+    }
+    return map;
+  }, [managedSources]);
 
   const {
     startInlineNewGroup,
@@ -1341,7 +1444,9 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   const isHostsSectionActive = currentSection === "hosts";
   const hasHostsSidePanel =
     isHostsSectionActive &&
-    ((isGroupPanelOpen && !!editingGroupPath) || isHostPanelOpen);
+    ((isGroupPanelOpen && !!editingGroupPath)
+      || isHostPanelOpen
+      || isLocalShellHostPanelOpen);
   // Every host grid uses the same container-based fixed column count. This keeps
   // pinned/recent cards aligned with the virtualized main grid and prevents a
   // single card from stretching across the full row.
@@ -1379,6 +1484,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     <>
       <HostTreeGroupDeleteDialog
         managedGroupPaths={managedGroupPaths}
+        managedFilesByGroupPath={managedFilesByGroupPath}
         onConfirmDelete={deleteGroupPath}
       />
       <VaultViewLayout
@@ -1454,6 +1560,9 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           handleHostConnect,
           handleImportFileSelected,
           handleNewHost,
+          handleNewLocalShellHost,
+          handleCancelLocalShellHost,
+          handleSaveLocalShellHost,
           handleProtocolSelect,
           handleQuickConnect,
           handleQuickConnectSaveHost,
@@ -1473,6 +1582,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           isDeleteGroupOpen,
           isGroupPanelOpen,
           isHostPanelOpen,
+          isLocalShellHostPanelOpen,
+          editingLocalShellHost,
           isHostsSectionActive,
           isImportOpen,
           isMultiSelectMode,
@@ -1487,6 +1598,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           keys,
           knownHosts,
           knownHostsManagerElement,
+          onAddKnownHost: handleAddKnownHost,
           Label,
           lastPinnedId,
           LayoutGrid,
@@ -1497,12 +1609,14 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           managedSources,
           moveGroup,
           moveHostToGroup,
+          moveHostsToGroup,
           Network,
           newFolderName,
           newHostGroupPath,
           NotebookText,
           NotesManager,
           onCommitPluginImporterData,
+          onConnect,
           onConnectSerial,
           onCreateLocalTerminal,
           onDeleteHost,

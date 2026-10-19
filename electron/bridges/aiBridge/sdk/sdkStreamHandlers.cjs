@@ -13,6 +13,13 @@ const { CodexAppServerRuntime } = require("../codexAppServer/runtime.cjs");
 const { probeCodexAppServer } = require("../codexAppServer/probe.cjs");
 const { codebuddySessionManager } = require("./codebuddySessionManager.cjs");
 const codebuddyDriver = require("./codebuddyDriver.cjs");
+const { OPENCODE_SERVER_START_TIMEOUT_MS } = require("./opencodeDriver.cjs");
+const {
+  buildLastKnownCatalogPath,
+  readLastKnownCatalogEntry,
+  refreshLastKnownCatalogCurrentId,
+  writeLastKnownCatalogEntry,
+} = require("./modelCatalogLastKnown.cjs");
 
 const VALID_BACKENDS = new Set(listBackends());
 
@@ -25,6 +32,11 @@ const VALID_BACKENDS = new Set(listBackends());
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const MODEL_CACHE_MAX_ENTRIES = 32;
 const MODEL_LIST_TIMEOUT_MS = 10000;
+// Per-backend overrides for the catalog budget above. MiMo cold-boots a
+// dedicated `mimo serve` process for every catalog pull (unlike OpenCode's
+// pooled server), so its server start + provider query needs more than the
+// shared default.
+const MODEL_LIST_TIMEOUT_OVERRIDES_MS = { mimo: 30_000 };
 const sdkModelCache = new Map();
 const sdkModelInFlight = new Map();
 const {
@@ -79,14 +91,55 @@ const SDK_MODEL_CACHE_ENV_KEYS = [
   "HOME",
   "USERPROFILE",
   "XDG_CONFIG_HOME",
+  "CODEX_HOME",
+  "CLAUDE_CONFIG_DIR",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  // A different endpoint serves a different model list for the same credentials.
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_OAUTH_TOKEN",
   "OPENCODE_BIN",
   "OPENCODE_CONFIG",
   "OPENCODE_CONFIG_DIR",
   "OPENCODE_CONFIG_CONTENT",
+  "MIMOCODE_HOME",
+  "MIMOCODE_BIN",
+  "MIMOCODE_BIN_PATH",
+  "MIMOCODE_CONFIG",
+  "MIMOCODE_CONFIG_DIR",
+  "MIMOCODE_MIMO_ONLY",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
   "CLAUDE_CODE_EXECUTABLE",
   "CODEBUDDY_CODE_PATH",
+  // CodeBuddy auth and network environment change which models the CLI can
+  // list: two profiles sharing a binary but not credentials must never share
+  // a catalog (cross-profile contamination).
+  "CODEBUDDY_API_KEY",
+  "CODEBUDDY_AUTH_TOKEN",
+  "CODEBUDDY_INTERNET_ENVIRONMENT",
+  // Grok auth switches between env credentials and the cached `grok login`
+  // token without changing the binary, so two accounts sharing one binary
+  // must not share a catalog either.
+  "XAI_API_KEY",
+  // `grok login` credentials live under GROK_CONFIG_DIR (default ~/.grok), so
+  // two login profiles that share HOME and the binary need separate catalogs.
+  "GROK_CONFIG_DIR",
+  "COPILOT_GITHUB_TOKEN",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_CONFIG_DIR",
   "CURSOR_API_KEY",
 ];
+
+// Margin subtracted from the outer catalog budget before handing the driver
+// an absolute deadline. Small on purpose: the reviewer's cold-boot scenario
+// (~20s `mimo serve` readiness + ~9s providers()) already needs ~29s of the
+// 30s outer budget, so a larger headroom would re-cap the pair below what
+// actually fits. The 1s keeps the inner deadline ahead of the outer
+// withTimeout, so an over-budget run fails inside the driver (clean empty
+// catalog + server teardown) instead of aborting mid-IPC.
+const MODEL_LIST_DEADLINE_HEADROOM_MS = 1_000;
 
 function buildSdkModelCacheKey(backendKey, binPath, env, runtime = "sdk") {
   const envFingerprint = SDK_MODEL_CACHE_ENV_KEYS
@@ -132,11 +185,66 @@ function shouldCacheSdkRuntimeModels(_backendKey) {
   return true;
 }
 
+/** Resolve the last-known-good catalog file under userData (null if unknown). */
+function resolveLastKnownCatalogPath(electronModule) {
+  try {
+    return buildLastKnownCatalogPath(electronModule?.app?.getPath?.("userData"));
+  } catch {
+    return null;
+  }
+}
+
 function normalizeSdkListModelsResult(raw) {
   const rawModels = Array.isArray(raw) ? raw : raw?.models;
   const currentModelId = Array.isArray(raw) ? null : raw?.currentModelId || null;
   const models = Array.isArray(rawModels) ? rawModels.filter((m) => m && m.id) : [];
   return { currentModelId, models };
+}
+
+/**
+ * Fetch a runtime model catalog for one SDK backend. For Codex on the default
+ * `sdk` runtime, the codex-sdk exposes no model catalog (its driver always
+ * returns []), so fall back to the App Server runtime's live `model/list`
+ * catalog — otherwise the picker stays pinned to build-time curated presets
+ * and cannot follow the installed CLI (#3496).
+ */
+async function fetchSdkModelCatalog({
+  backendKey,
+  codexRuntime,
+  driver,
+  binPath,
+  env,
+  abortController,
+  cursorAuthMode,
+  cursorCliBinPath,
+  codexAppServerRuntime: appServerRuntime,
+  catalogDeadlineTs,
+}) {
+  let raw;
+  if (codexRuntime === "app-server") {
+    raw = await appServerRuntime.listModels({ binPath, env });
+  } else {
+    raw = await driver.listModels({
+      binPath,
+      env,
+      abortController,
+      // Absolute deadline for drivers with multi-phase inner setups (mimo:
+      // server readiness + providers query) to share, so the pair can never
+      // outrun the outer catalog budget. Drivers without such phases ignore it.
+      catalogDeadlineTs,
+      cursorAuthMode: backendKey === "cursor" ? cursorAuthMode : undefined,
+      cursorCliBinPath: backendKey === "cursor" ? cursorCliBinPath : undefined,
+    });
+    const sdkCatalog = normalizeSdkListModelsResult(raw);
+    if (backendKey === "codex" && sdkCatalog.models.length === 0 && !sdkCatalog.currentModelId) {
+      raw = await appServerRuntime.listModels({ binPath, env });
+    }
+  }
+  const { currentModelId, models } = normalizeSdkListModelsResult(raw);
+  if (models.length === 0 && !currentModelId) {
+    throw new Error("The live model catalog returned no models");
+  }
+  return raw;
 }
 
 function resolveSdkPromptPlacement({
@@ -145,7 +253,7 @@ function resolveSdkPromptPlacement({
   contextualPrompt,
   systemContext,
 }) {
-  const supportsSystemContext = backendKey === "opencode" || backendKey === "codebuddy";
+  const supportsSystemContext = backendKey === "opencode" || backendKey === "mimo" || backendKey === "codebuddy";
   return {
     prompt: supportsSystemContext ? turnPrompt : contextualPrompt,
     systemPrompt: supportsSystemContext ? systemContext : undefined,
@@ -387,6 +495,11 @@ function resolveSdkBackendBinPath({
     const rawPath = configuredEnvPath || resolveCliFromPath(backendKey, shellEnv) || undefined;
     return rawPath ? resolveRealCliPath(rawPath, realpath) : undefined;
   }
+  if (backendKey === "mimo") {
+    const configuredEnvPath = normalizeCliPathForPlatform?.(env?.MIMOCODE_BIN || env?.MIMOCODE_BIN_PATH);
+    const rawPath = configuredEnvPath || resolveCliFromPath(backendKey, shellEnv) || undefined;
+    return rawPath ? resolveRealCliPath(rawPath, realpath) : undefined;
+  }
   return resolveSdkBinPath?.(backendKey, shellEnv) || undefined;
 }
 
@@ -490,6 +603,9 @@ function shouldReplaySdkHistory({
 }
 
 function registerSdkStreamHandlers(ctx) {
+  const injectCliEnv = typeof ctx.withCliDiscoveryEnv === "function"
+    ? ctx.withCliDiscoveryEnv
+    : (env) => env;
   with (ctx) {
     // chatSessionId -> { sessionId } for resume; controller per requestId.
     const sdkActiveStreams = new Map(); // requestId -> AbortController
@@ -520,10 +636,10 @@ function registerSdkStreamHandlers(ctx) {
           model, existingSessionId, toolIntegrationMode,
           defaultTargetSession, userSkillsContext, agentEnv: requestedAgentEnv, agentCommand,
           codexRuntime: requestedCodexRuntime, permissionMode,
-          // SDK 0.3.230 advanced options (passed from renderer via sdkAgentAdapter)
+          // SDK 0.3.258 advanced options (passed from renderer via sdkAgentAdapter)
           effort, maxTurns, maxBudgetUsd, fallbackModel,
           sandbox, agents, outputFormat, enableFileCheckpointing,
-          traceId, parentSpanId,
+          traceId, parentSpanId, persistSession,
         } = payload;
 
         const backendKey = resolveBackendKey(sdkBackend);
@@ -571,7 +687,7 @@ function registerSdkStreamHandlers(ctx) {
           let env = buildSdkAgentEnv({
             shellEnv,
             requestedAgentEnv: normalizedAgentEnv,
-            withCliDiscoveryEnv,
+            withCliDiscoveryEnv: (agentEnv) => injectCliEnv(agentEnv, chatSessionId),
             normalizeClaudeCodeExecutableEnv: normalizeClaudeCodeExecutableEnvForSdk,
           });
           if (cursorAuthMode === "cli-login") {
@@ -736,7 +852,7 @@ function registerSdkStreamHandlers(ctx) {
               }
             },
           };
-          const skillsPathAllowlist = effectiveMode === "skills" && backendKey === "opencode"
+          const skillsPathAllowlist = effectiveMode === "skills" && (backendKey === "opencode" || backendKey === "mimo")
             ? buildNetcattySkillsOpenCodePathAllowlist({
               launcherPath: NETCATTY_TOOL_LAUNCHER_PATH,
               cliScriptPath: NETCATTY_TOOL_CLI_PATH,
@@ -790,7 +906,8 @@ function registerSdkStreamHandlers(ctx) {
             // when the CLI hits a security restriction, route the decision
             // through the renderer approval UI instead of throwing an error.
             requestApprovalFromRenderer: mcpServerBridge.requestApprovalFromRenderer,
-            // SDK 0.3.230 advanced options
+            clearPendingApprovals: mcpServerBridge.clearPendingApprovals,
+            // SDK 0.3.258 advanced options
             effort: effort || undefined,
             maxTurns: maxTurns || undefined,
             maxBudgetUsd: maxBudgetUsd || undefined,
@@ -801,6 +918,7 @@ function registerSdkStreamHandlers(ctx) {
             enableFileCheckpointing: enableFileCheckpointing != null ? enableFileCheckpointing : undefined,
             traceId: traceId || undefined,
             parentSpanId: parentSpanId || undefined,
+            persistSession: persistSession != null ? persistSession : undefined,
           };
           const result = codexRuntime === "app-server"
             ? await codexAppServerRuntime.runTurn(commonTurnContext)
@@ -884,9 +1002,10 @@ function registerSdkStreamHandlers(ctx) {
         const codexRuntime = backendKey === "codex" && requestedCodexRuntime === "app-server"
           ? "app-server"
           : "sdk";
-        // claude/copilot/opencode enumerate models via the SDK; codex has no
-        // catalog (its driver returns []), so the renderer falls back to curated
-        // presets. Cache + in-flight coalescing avoid spawn storms (#2184).
+        // claude/copilot/opencode enumerate models via the SDK; codex's sdk
+        // driver returns [] and falls back to the App Server catalog (see
+        // fetchSdkModelCatalog). Cache + in-flight coalescing avoid spawn
+        // storms (#2184).
         const cacheKey = buildSdkModelCacheKey(
           backendKey,
           cursorAuthMode === "cli-login" ? (cursorCliBinPath || binPath) : binPath,
@@ -896,45 +1015,130 @@ function registerSdkStreamHandlers(ctx) {
         const shouldCacheModels = shouldCacheSdkRuntimeModels(backendKey);
         const cached = shouldCacheModels ? getSdkModelCacheEntry(sdkModelCache, cacheKey) : null;
         if (cached) {
-          return { ok: true, currentModelId: cached.currentModelId || null, models: cached.models };
+          // A cache hit replays the live fetch that populated the entry, so it
+          // keeps the live provenance (and the original fetchedAt).
+          return {
+            ok: true,
+            currentModelId: cached.currentModelId || null,
+            models: cached.models,
+            ...(cached.fetchedAt ? { source: "live", fetchedAt: cached.fetchedAt } : {}),
+          };
         }
 
         const existing = sdkModelInFlight.get(cacheKey);
         if (existing) return await existing;
 
+        const lastKnownPath = resolveLastKnownCatalogPath(electronModule);
         const loadPromise = (async () => {
           const abortController = new AbortController();
           try {
+            // Include OpenCode cold startup in this single cancellable
+            // catalog budget, then allow the normal provider-query budget.
+            // Per-backend overrides (see MODEL_LIST_TIMEOUT_OVERRIDES_MS)
+            // win over both the shared default and OpenCode's budget.
+            const catalogBudgetMs = MODEL_LIST_TIMEOUT_OVERRIDES_MS[backendKey]
+              ?? (backendKey === "opencode"
+                ? OPENCODE_SERVER_START_TIMEOUT_MS + MODEL_LIST_TIMEOUT_MS
+                : MODEL_LIST_TIMEOUT_MS);
             const raw = await withTimeout(
-              codexRuntime === "app-server"
-                ? codexAppServerRuntime.listModels({ binPath, env })
-                : driver.listModels({
-                  binPath,
-                  env,
-                  abortController,
-                  cursorAuthMode: backendKey === "cursor" ? cursorAuthMode : undefined,
-                  cursorCliBinPath: backendKey === "cursor" ? cursorCliBinPath : undefined,
-                }),
-              MODEL_LIST_TIMEOUT_MS,
+              fetchSdkModelCatalog({
+                backendKey,
+                codexRuntime,
+                driver,
+                binPath,
+                env,
+                abortController,
+                catalogDeadlineTs: Date.now() + catalogBudgetMs - MODEL_LIST_DEADLINE_HEADROOM_MS,
+                cursorAuthMode: backendKey === "cursor" ? cursorAuthMode : undefined,
+                cursorCliBinPath: backendKey === "cursor" ? cursorCliBinPath : undefined,
+                codexAppServerRuntime,
+              }),
+              catalogBudgetMs,
               abortController,
             );
             const { currentModelId, models } = normalizeSdkListModelsResult(raw);
+            const fetchedAt = new Date().toISOString();
             // Do not cache degraded empty catalogs: listOpenCodeModels and
             // other drivers often return [] on timeout/startup failure, and
             // pinning that for TTL would block recovery (matches renderer
             // sdkRuntimeModelCache behavior).
             if (shouldCacheModels && (models.length > 0 || currentModelId)) {
-              setSdkModelCacheEntry(sdkModelCache, cacheKey, { at: Date.now(), currentModelId, models });
+              setSdkModelCacheEntry(sdkModelCache, cacheKey, { at: Date.now(), currentModelId, models, fetchedAt });
             }
-            return { ok: true, currentModelId, models };
+            // Persist the good catalog so a later live failure (CLI update,
+            // cold-boot race, dead binary) can serve it instead of presets.
+            // Best-effort: an IO error must never fail the fetch itself.
+            if (models.length > 0) {
+              writeLastKnownCatalogEntry(lastKnownPath, cacheKey, {
+                backend: backendKey,
+                models,
+                currentModelId,
+              });
+            } else if (currentModelId) {
+              // A current-only success still advertises a usable selection.
+              // Keep previous rows when available; otherwise persist that
+              // selection as one visible row for a later failed load.
+              if (readLastKnownCatalogEntry(lastKnownPath, cacheKey)) {
+                refreshLastKnownCatalogCurrentId(lastKnownPath, cacheKey, currentModelId);
+              } else {
+                writeLastKnownCatalogEntry(lastKnownPath, cacheKey, {
+                  backend: backendKey,
+                  models: [{ id: currentModelId, name: currentModelId }],
+                  currentModelId,
+                });
+              }
+            }
+            return {
+              ok: true,
+              currentModelId,
+              models,
+              source: "live",
+              fetchedAt,
+            };
           } catch (err) {
-            // Degrade to [] so the renderer keeps its curated presets (never empty).
+            // Degrade to curated presets, but first offer the last-known-good
+            // catalog persisted from a prior successful fetch (preferred over
+            // presets, including copilot's single `auto` entry). The warning
+            // keeps the renderer's retry banner, and the marker lets the UI
+            // say the list is the previous success.
+            const lastKnown = readLastKnownCatalogEntry(lastKnownPath, cacheKey);
+            if (lastKnown) {
+              // Serve a current id the picker can show (visible default, else
+              // first remaining model). A persisted id can be absent from the
+              // persisted rows: mimo entries written before the auto-channel
+              // normalization carry one on the filtered `mimo` provider, and
+              // any backend can advertise a default whose provider returned
+              // no rows. The picker would show the first row while the send
+              // preflight adopted the hidden id, so remap it for every backend.
+              // No persisted current id means "use the backend default": keep null.
+              const lastKnownCurrentModelId = !lastKnown.currentModelId
+                ? null
+                // An effort-decorated id (grok-4.6/high) is served as is when its
+                // base row advertises that level, matching the renderer's
+                // modelPresetsContainId; any other suffix stays a dangling id.
+                : lastKnown.models.some((model) => model.id === lastKnown.currentModelId
+                  || (Array.isArray(model.thinkingLevels)
+                    && model.thinkingLevels.some((level) => `${model.id}/${level}` === lastKnown.currentModelId)))
+                  ? lastKnown.currentModelId
+                  : lastKnown.models[0]?.id ?? null;
+              console.debug(
+                `[sdk] list-models(${backendKey}) unavailable, serving last-known-good catalog from ${lastKnown.fetchedAt}`,
+              );
+              return {
+                ok: true,
+                currentModelId: lastKnownCurrentModelId,
+                models: lastKnown.models,
+                warning: `${err?.message || String(err)} — serving the last-known-good catalog fetched at ${lastKnown.fetchedAt}`,
+                source: "last-known-good",
+                fetchedAt: lastKnown.fetchedAt,
+              };
+            }
             console.debug(`[sdk] list-models(${backendKey}) unavailable, using curated presets`);
             return {
               ok: true,
               currentModelId: null,
               models: [],
-              warning: codexRuntime === "app-server" ? (err?.message || String(err)) : undefined,
+              warning: err?.message || String(err),
             };
           }
         })();
@@ -954,9 +1158,7 @@ function registerSdkStreamHandlers(ctx) {
           ok: true,
           currentModelId: null,
           models: [],
-          warning: backendKey === "codex" && requestedCodexRuntime === "app-server"
-            ? (err?.message || String(err))
-            : undefined,
+          warning: err?.message || String(err),
         };
       }
     });
@@ -976,7 +1178,7 @@ function registerSdkStreamHandlers(ctx) {
       const runtime = sdkRequestRuntimes.get(requestId);
       if (!runtime) return { status: "busy" };
 
-      // SDK 0.3.230 Session.send() resets the active message stream, so it
+      // SDK 0.3.258 Session.send() resets the active message stream, so it
       // cannot safely implement mid-turn steering.
       if (runtime.backendKey === "codebuddy") {
         return { status: "unsupported" };
@@ -1093,7 +1295,7 @@ function registerSdkStreamHandlers(ctx) {
       }
     });
 
-    // --- CodeBuddy SDK 0.3.230 IPC handlers ---
+    // --- CodeBuddy SDK 0.3.258 IPC handlers ---
 
     ipcMain.handle("netcatty:ai:sdk-agent:mcp-status", async (event, payload) => {
       if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
@@ -1210,6 +1412,7 @@ function registerSdkStreamHandlers(ctx) {
     ctx.sdkActiveStreams = sdkActiveStreams;
     ctx.sdkRequestSessions = sdkRequestSessions;
     ctx.sdkRequestRuntimes = sdkRequestRuntimes;
+    ctx.sdkModelCache = sdkModelCache; // exposed for catalog tests
     ctx.codexAppServerRuntime = codexAppServerRuntime;
     ctx.codebuddySessionManager = codebuddySessionManager;
   }
@@ -1217,10 +1420,12 @@ function registerSdkStreamHandlers(ctx) {
 
 module.exports = {
   registerSdkStreamHandlers,
+  MODEL_LIST_TIMEOUT_OVERRIDES_MS,
   resolveBackendKey,
   resolveSdkBackendBinPath,
   buildSdkSessionKey,
   buildSdkModelCacheKey,
+  SDK_MODEL_CACHE_ENV_KEYS,
   getSdkModelCacheEntry,
   setSdkModelCacheEntry,
   normalizeSdkListModelsResult,
@@ -1229,6 +1434,7 @@ module.exports = {
   expireSiblingCursorCliModeSessions,
   expireSiblingGrokRuntimeSessions,
   shouldCacheSdkRuntimeModels,
+  fetchSdkModelCatalog,
   normalizeHistoryMessages,
   formatSdkHistoryReplaySection,
   buildSdkTurnPrompt,

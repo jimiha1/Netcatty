@@ -18,6 +18,7 @@ const codebuddy = require("./codebuddyDriver.cjs");
 const opencode = require("./opencodeDriver.cjs");
 const grok = require("./grokDriver.cjs");
 const grokAcp = require("./grokAcpDriver.cjs");
+const mimo = require("./mimoDriver.cjs");
 const { codebuddySessionManager } = require("./codebuddySessionManager.cjs");
 
 function hasCodebuddyQueryOnlyOptions(options) {
@@ -75,7 +76,9 @@ const DRIVER_REGISTRY = {
         signal: ctx.signal,
       });
     },
-    // codex-sdk exposes no model catalog; the UI falls back to curated presets.
+    // codex-sdk exposes no model catalog. sdkStreamHandlers falls back to the
+    // App Server runtime's live `model/list` when this returns empty (#3496);
+    // curated presets remain the last resort in the renderer.
     async listModels() { return []; },
   },
   copilot: {
@@ -101,6 +104,7 @@ const DRIVER_REGISTRY = {
     async listModels(ctx) {
       return copilot.listCopilotModels({
         cliPath: ctx.binPath,
+        runtimeEnv: ctx.env,
         abortController: ctx.abortController,
         signal: ctx.signal,
       });
@@ -186,7 +190,7 @@ const DRIVER_REGISTRY = {
         resume: ctx.resumeSessionId,
         pathToCodebuddyCode: ctx.binPath,
         toolIntegrationMode: ctx.toolIntegrationMode,
-        // SDK 0.3.230 options
+        // SDK 0.3.258 options
         systemPrompt: ctx.systemPrompt,
         effort: ctx.effort,
         maxTurns: ctx.maxTurns,
@@ -198,6 +202,7 @@ const DRIVER_REGISTRY = {
         enableFileCheckpointing: ctx.enableFileCheckpointing,
         traceId: ctx.traceId,
         parentSpanId: ctx.parentSpanId,
+        persistSession: ctx.persistSession,
         hooks: codebuddy.buildCodebuddyHooks(ctx.emitter, {
           toolIntegrationMode: ctx.toolIntegrationMode,
           additionalHooks: ctx.hooks,
@@ -239,6 +244,9 @@ const DRIVER_REGISTRY = {
           agents: options.agents,
           thinking: options.thinking,
           effort: options.effort,
+          // SessionOptions gained persistSession in SDK 0.3.258; without this the
+          // V2 path would silently drop the setting (query() already forwards it).
+          persistSession: options.persistSession,
         };
         const v2Result = await codebuddySessionManager.runTurn({
           sessionKey,
@@ -358,24 +366,54 @@ const DRIVER_REGISTRY = {
       });
     },
     async listModels(ctx) {
-      const acpCatalog = await grokAcp.listGrokAcpModels({
-        binPath: ctx.binPath,
-        env: ctx.env,
-        abortController: ctx.abortController,
-        signal: ctx.signal || ctx.abortController?.signal,
-      });
-      if (acpCatalog.models.length > 0) {
-        return acpCatalog;
+      // Run both probes together and union the results. ACP's
+      // `_meta.modelState` reflects the negotiated agent session and can
+      // advertise a subset of the account's models (observed: only
+      // grok-4.6/4.5, missing the 4.7 family), while `grok models` lists the
+      // full account set; treating a non-empty ACP catalog as complete made
+      // the picker silently drop models one source knows about. ACP entries
+      // win for shared ids because they carry live vendor `_meta` (reasoning
+      // efforts, description) -- see mergeGrokCatalogModels.
+      const parentSignal = ctx.signal || ctx.abortController?.signal;
+      const probeController = new AbortController();
+      const signal = parentSignal
+        ? AbortSignal.any([parentSignal, probeController.signal])
+        : probeController.signal;
+      let acpCatalog = { currentModelId: null, models: [] };
+      let fallbackCatalog = { currentModelId: null, models: [] };
+      let timer;
+      try {
+        await Promise.race([
+          Promise.all([
+            grokAcp.listGrokAcpModels({
+              binPath: ctx.binPath,
+              env: ctx.env,
+              signal,
+            }).then((catalog) => { acpCatalog = catalog; }),
+            grok.listGrokModels({
+              binPath: ctx.binPath,
+              env: ctx.env,
+              signal,
+            }).then((catalog) => { fallbackCatalog = catalog; }),
+          ]),
+          new Promise((resolve) => {
+            // Settle before the outer IPC timeout so one stalled probe cannot
+            // discard the other catalog. Existing driver abort paths reap
+            // unfinished children independently of returning these results.
+            const deadlineTs = ctx.catalogDeadlineTs ?? Date.now() + 9_000;
+            timer = setTimeout(() => {
+              probeController.abort();
+              resolve();
+            }, Math.max(0, deadlineTs - Date.now()));
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
       }
-      const fallbackCatalog = await grok.listGrokModels({
-        binPath: ctx.binPath,
-        env: ctx.env,
-        abortController: ctx.abortController,
-        signal: ctx.signal || ctx.abortController?.signal,
-      });
       const currentModelId = acpCatalog.currentModelId || fallbackCatalog.currentModelId;
-      const models = fallbackCatalog.models.length > 0
-        ? fallbackCatalog.models
+      const merged = grok.mergeGrokCatalogModels(acpCatalog.models, fallbackCatalog.models);
+      const models = merged.length > 0
+        ? merged
         : (currentModelId
           ? [grok.applyGrokReasoningFallback({ id: currentModelId, name: currentModelId })]
           : []);
@@ -383,6 +421,45 @@ const DRIVER_REGISTRY = {
         currentModelId: grok.resolveGrokCatalogCurrentModelId(models, currentModelId),
         models,
       };
+    },
+  },
+  // MiMo Code is an OpenCode fork, so this mirrors the opencode entry above.
+  // The driver runs `mimo serve` itself instead of `@mimo-ai/sdk`'s
+  // createOpencode(), which cannot parse MiMo's readiness banner; see
+  // mimoDriver.cjs for the details.
+  mimo: {
+    async runTurn(ctx) {
+      return mimo.runMimoTurn({
+        prompt: ctx.prompt,
+        systemPrompt: ctx.systemPrompt,
+        attachments: ctx.attachments,
+        cwd: ctx.cwd,
+        model: ctx.model,
+        env: ctx.env,
+        binPath: ctx.binPath,
+        injectedMcpServers: ctx.injectedMcpServers,
+        toolIntegrationMode: ctx.toolIntegrationMode,
+        skillsPathAllowlist: ctx.skillsPathAllowlist,
+        permissionMode: ctx.permissionMode,
+        chatSessionId: ctx.chatSessionId,
+        requestApprovalFromRenderer: ctx.requestApprovalFromRenderer,
+        clearPendingApprovals: ctx.clearPendingApprovals,
+        resumeSessionId: ctx.resumeSessionId,
+        emitter: ctx.emitter,
+        abortController: ctx.abortController,
+      });
+    },
+    async listModels(ctx) {
+      return mimo.listMimoModels({
+        env: ctx.env,
+        binPath: ctx.binPath,
+        cwd: ctx.cwd,
+        abortController: ctx.abortController,
+        signal: ctx.abortController?.signal || ctx.signal,
+        // Shared outer catalog deadline (see MODEL_LIST_DEADLINE_HEADROOM_MS
+        // in sdkStreamHandlers.cjs): readiness + providers cannot exceed it.
+        deadlineTs: ctx.catalogDeadlineTs,
+      });
     },
   },
 };

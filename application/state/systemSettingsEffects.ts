@@ -2,6 +2,7 @@ import { useEffect, useRef, type MutableRefObject } from 'react';
 import {
   STORAGE_KEY_AUTO_UPDATE_ENABLED,
   STORAGE_KEY_CLOSE_TO_TRAY,
+  STORAGE_KEY_SHOW_TRAY_ICON,
   STORAGE_KEY_AUTO_LAUNCH_ENABLED,
   STORAGE_KEY_GLOBAL_HOTKEY_ENABLED,
   STORAGE_KEY_TOGGLE_WINDOW_HOTKEY,
@@ -42,6 +43,7 @@ interface UseSystemSettingsEffectsParams {
   toggleWindowHotkey: string;
   globalHotkeyEnabled: boolean;
   closeToTray: boolean;
+  showTrayIcon: boolean;
   autoLaunchEnabled: boolean;
   windowOpacityRecord: WindowOpacityRecord;
   windowOpacityMutationSourceRef: MutableRefObject<WindowOpacityMutationSource>;
@@ -62,6 +64,7 @@ export function useSystemSettingsEffects({
   toggleWindowHotkey,
   globalHotkeyEnabled,
   closeToTray,
+  showTrayIcon,
   autoLaunchEnabled,
   windowOpacityRecord,
   windowOpacityMutationSourceRef,
@@ -173,6 +176,24 @@ export function useSystemSettingsEffects({
     notifySettingsChanged(STORAGE_KEY_CLOSE_TO_TRAY, closeToTray);
   }, [enabled, closeToTray, notifySettingsChanged, persistMountedRef]);
 
+  // Persist and sync the show-tray-icon setting. Runs after the close-to-tray
+  // effect above (declaration order) so a hidden icon destroys the tray that
+  // close-to-tray's mount-time push may have just created.
+  useEffect(() => {
+    if (!enabled) return;
+    // Update main process tray visibility (needed on mount)
+    const bridge = netcattyBridge.get();
+    if (bridge?.setShowTrayIcon) {
+      bridge.setShowTrayIcon(showTrayIcon).catch((err) => {
+        console.warn('[SystemTray] Failed to set show-tray-icon:', err);
+      });
+    }
+    localStorageAdapter.writeString(STORAGE_KEY_SHOW_TRAY_ICON, showTrayIcon ? 'true' : 'false');
+    // Skip IPC on initial mount
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_SHOW_TRAY_ICON, showTrayIcon);
+  }, [enabled, showTrayIcon, notifySettingsChanged, persistMountedRef]);
+
   // Hydrate auto-launch from the main process on mount — the OS login item
   // is the real source of truth (the user may have toggled it outside the
   // app), localStorage is only an optimistic cache for first paint.
@@ -245,9 +266,9 @@ export function useSystemSettingsEffects({
     notifySettingsChanged(STORAGE_KEY_HTTP_NETWORK_PROXY, normalized);
   }, [enabled, httpNetworkProxy, notifySettingsChanged, persistMountedRef]);
 
-  // Persist and sync window opacity
+  // Window chrome also applies in detached sessions, independently of the
+  // OS-level effects disabled there (tray, global shortcuts, autolaunch, ...).
   useEffect(() => {
-    if (!enabled) return;
     const bridge = netcattyBridge.get();
     bridge?.setWindowOpacity?.(windowOpacityRecord.opacity).catch((err) => {
       console.warn('[WindowOpacity] Failed to apply window opacity:', err);
@@ -273,7 +294,6 @@ export function useSystemSettingsEffects({
     if (!decision.shouldBroadcast) return;
     notifySettingsChanged(STORAGE_KEY_WINDOW_OPACITY, windowOpacityRecord);
   }, [
-    enabled,
     windowOpacityRecord,
     windowOpacityMutationSourceRef,
     notifySettingsChanged,

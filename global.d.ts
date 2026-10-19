@@ -93,6 +93,7 @@ declare global {
   }
 
   interface NetcattySSHOptions {
+    keyLabel?: string;
     sessionId?: string;
     hostId?: string;
     hostLabel?: string;
@@ -175,16 +176,25 @@ declare global {
      * Default true (normal terminal, browse, and MFA-skip reuse).
      */
     reuseTransport?: boolean;
+    /** Runtime stamp for one session channel on this TCP. Set after a recognized bastion banner, not from saved host settings. */
+    singleChannelSsh?: boolean;
+    /** Original unsaved-password profile; main retains only its digest for live SFTP borrowing. */
+    sftpReuseOptions?: NetcattySSHOptions;
   }
 
   interface SftpStatResult {
     name: string;
     type: 'file' | 'directory' | 'symlink';
     size: number;
+    /** False when the endpoint cannot report a size (stat-less SCP); size is a placeholder 0. */
+    sizeKnown?: boolean;
     lastModified: number; // timestamp
     permissions?: string; // e.g., "rwxr-xr-x"
     owner?: string;
     group?: string;
+    /** Local-only filesystem identity; undefined for remote SFTP stats. */
+    dev?: number;
+    ino?: number;
   }
 
   interface SftpTransferProgress {
@@ -235,11 +245,13 @@ declare global {
     keepaliveCountMax?: number;
     sshTcpConnectTimeoutMs?: number;
     sshAuthReadyTimeoutMs?: number;
+    reuseTransport?: boolean;
   }
 
   interface PortForwardResult {
     tunnelId: string;
     success: boolean;
+    localPort?: number;
     cancelled?: boolean;
     blockedByCleanup?: boolean;
     reused?: boolean;

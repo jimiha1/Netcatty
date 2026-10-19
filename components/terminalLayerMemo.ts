@@ -53,6 +53,8 @@ export const terminalLayerAreEqual = (
   prev.sftpAutoOpenSidebar === next.sftpAutoOpenSidebar &&
   prev.terminalSidePanelAutoOpen === next.terminalSidePanelAutoOpen &&
   prev.terminalSidePanelAutoOpenTab === next.terminalSidePanelAutoOpenTab &&
+  prev.localShellSidePanelAutoOpen === next.localShellSidePanelAutoOpen &&
+  prev.localShellSidePanelAutoOpenTab === next.localShellSidePanelAutoOpenTab &&
   prev.sftpFollowTerminalCwd === next.sftpFollowTerminalCwd &&
   prev.setSftpFollowTerminalCwd === next.setSftpFollowTerminalCwd &&
   prev.editorWordWrap === next.editorWordWrap &&
@@ -64,6 +66,7 @@ export const terminalLayerAreEqual = (
   prev.onUpdateHost === next.onUpdateHost &&
   prev.onAddKnownHost === next.onAddKnownHost &&
   prev.onDeleteShellHistoryEntry === next.onDeleteShellHistoryEntry &&
+  prev.onClearCommandHistory === next.onClearCommandHistory &&
   prev.onToggleWorkspaceViewMode === next.onToggleWorkspaceViewMode &&
   prev.onSetWorkspaceFocusedSession === next.onSetWorkspaceFocusedSession &&
   prev.onReorderWorkspaceSessions === next.onReorderWorkspaceSessions &&

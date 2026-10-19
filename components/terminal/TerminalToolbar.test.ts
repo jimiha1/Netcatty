@@ -68,6 +68,21 @@ test("keeps SFTP visible before the terminal overflow menu for SSH sessions", ()
   assert.ok(sftpIndex < moreIndex);
 });
 
+test("browser action remains available when an SSH terminal is disconnected", () => {
+  const disconnectedSsh = renderToolbar(sshHost, "disconnected", { onOpenBrowser: () => {} });
+  const serial = renderToolbar(serialHost, "connected", { onOpenBrowser: () => {} });
+  assert.match(disconnectedSsh, /aria-label="Open Browser"/);
+  assert.doesNotMatch(disconnectedSsh, /aria-label="Open Browser"[^>]*disabled/);
+  assert.doesNotMatch(serial, /aria-label="Open Browser"/);
+});
+
+test("browser action is available for supported local and mosh terminals", () => {
+  for (const protocol of ['local', 'mosh'] as const) {
+    const markup = renderToolbar({ ...sshHost, protocol }, "connected", { onOpenBrowser: () => {} });
+    assert.match(markup, /aria-label="Open Browser"/);
+  }
+});
+
 test("keeps Scripts visible before the terminal overflow menu", () => {
   const markup = renderToolbar(sshHost);
 
@@ -108,14 +123,14 @@ test("marks manual session log button active while logging", () => {
   );
 });
 
-test("hides SFTP for local terminal sessions", () => {
+test("shows SFTP for local terminal sessions", () => {
   const markup = renderToolbar({
     ...sshHost,
     id: "local-1",
     protocol: "local",
   });
 
-  assert.equal(markup.includes('aria-label="Open SFTP"'), false);
+  assert.equal(markup.includes('aria-label="Open SFTP"'), true);
 });
 
 test("hides SSH history for plugin terminal sessions", () => {
@@ -192,3 +207,9 @@ test("compact scripts popover hosts bulk-delete confirm outside the popover", ()
     false,
   );
 });
+
+for (const host of [serialHost, pluginHost]) {
+  test(`hides SFTP for ${host.protocol} sessions`, () => {
+    assert.equal(renderToolbar(host).includes('aria-label="Open SFTP"'), false);
+  });
+}

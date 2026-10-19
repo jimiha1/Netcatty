@@ -16,6 +16,12 @@ const {
   resolveEncodingForRequest,
 } = require("./sftpBridge.cjs");
 const { isScpModeClient, getScpBackendForClient } = require("./sftpBridge/scpBackend.cjs");
+const {
+  statLocal,
+  openLocal,
+  openLocalReadStream,
+  fastPutLocal,
+} = require("./asarSafeFs.cjs");
 const { executeBoundedSshCommand } = require("./boundedSshExec.cjs");
 const { openBoundedSftpChannel } = require("./boundedSftpOpen.cjs");
 const {
@@ -730,14 +736,96 @@ async function hashReadable(readable, options = {}) {
 
 const EMPTY_SHA256_HEX = crypto.createHash("sha256").update("").digest("hex");
 
-function hashLocalPrefix(filePath, bytes, options) {
-  if (!Number.isFinite(bytes) || bytes < 0) return Promise.resolve(null);
-  if (bytes === 0) return Promise.resolve(EMPTY_SHA256_HEX);
-  return hashReadable(fs.createReadStream(filePath, { start: 0, end: bytes - 1 }), options);
+function localStreamCancellationError() {
+  const error = new Error("Transfer cancelled");
+  error.code = "ABORT_ERR";
+  return error;
 }
 
-function hashLocalFile(filePath, options = {}) {
-  return hashReadable(fs.createReadStream(filePath), options);
+// Local fingerprint reads go through asarSafeFs, whose fd open is asynchronous
+// and can stay pending for a long time on an unresponsive filesystem (NFS/SMB,
+// removable media). Race that open against the cancellation signal so aborting
+// the transfer rejects immediately instead of waiting for the open to settle;
+// a stream that only arrives after cancellation is destroyed (closing its fd)
+// instead of leaking. hashReadable() only covers the post-open stream lifetime.
+function raceLocalStreamOpenAgainstAbort(openPromise, signal) {
+  if (!signal) return openPromise;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const destroyLateStream = (stream) => {
+      try { stream?.destroy?.(); } catch { /* ignore */ }
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      if (lateStream) destroyLateStream(lateStream);
+      reject(localStreamCancellationError());
+    };
+    let lateStream = null;
+    signal.addEventListener?.("abort", onAbort, { once: true });
+    // AbortSignal does not replay its event: if the signal was already aborted
+    // (e.g. while a preceding statLocal() was pending), the listener above will
+    // never fire. Reject immediately so a stalled open cannot leave the request
+    // pending; a stream that arrives later is still destroyed via lateStream.
+    if (signal.aborted) {
+      settled = true;
+      signal.removeEventListener?.("abort", onAbort);
+      reject(localStreamCancellationError());
+      // Still observe the pending open: destroy a late-resolving stream so its
+      // fd is closed, and swallow its rejection so it cannot surface as a
+      // process-level unhandledRejection.
+      openPromise.then(
+        (stream) => { destroyLateStream(stream); },
+        () => { /* already rejected with the cancellation error */ },
+      );
+      return;
+    }
+    openPromise.then(
+      (stream) => {
+        lateStream = stream;
+        if (settled) {
+          destroyLateStream(stream);
+          return;
+        }
+        if (signal.aborted) {
+          settled = true;
+          destroyLateStream(stream);
+          signal.removeEventListener?.("abort", onAbort);
+          reject(localStreamCancellationError());
+          return;
+        }
+        settled = true;
+        signal.removeEventListener?.("abort", onAbort);
+        resolve(stream);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener?.("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+// Local source reads go through asarSafeFs so real files named *.asar are not
+// mistaken for asar archives by Electron's fs wrapper (#3450).
+async function hashLocalPrefix(filePath, bytes, options) {
+  if (!Number.isFinite(bytes) || bytes < 0) return Promise.resolve(null);
+  if (bytes === 0) return Promise.resolve(EMPTY_SHA256_HEX);
+  const stream = await raceLocalStreamOpenAgainstAbort(
+    openLocalReadStream(filePath, { start: 0, end: bytes - 1 }),
+    options?.signal,
+  );
+  return hashReadable(stream, options);
+}
+
+async function hashLocalFile(filePath, options = {}) {
+  const stream = await raceLocalStreamOpenAgainstAbort(
+    openLocalReadStream(filePath),
+    options.signal,
+  );
+  return hashReadable(stream, options);
 }
 
 async function hashRemotePrefixViaSshCommand(client, remotePath, bytes, options = {}) {
@@ -746,6 +834,8 @@ async function hashRemotePrefixViaSshCommand(client, remotePath, bytes, options 
   // For a root-only source, head can fail while sha256sum/openssl still emit the
   // empty-input digest and exit 0 — skip the command path and use elevated SFTP.
   if (client?.__netcattySudoMode) return null;
+  // Prefix hashing through exec would be a second channel on this login.
+  if (client?.__netcattySingleChannelSsh || client?.client?.__netcattySingleChannelSsh) return null;
   const sshClient = client?.client;
   if (!sshClient || typeof sshClient.exec !== "function") return null;
 
@@ -807,7 +897,7 @@ async function hashRemoteFile(client, sftpId, filePath, encoding, options = {}) 
   // The server-side helper has no portable byte progress and its command stream
   // is not consistently abortable across SSH backends. Visible/cancellable
   // verification therefore uses the SFTP stream path below.
-  if (!options.signal && !options.onProgress && sshClient && typeof sshClient.exec === "function") {
+  if (!options.signal && !options.onProgress && sshClient && typeof sshClient.exec === "function" && !client.__netcattySingleChannelSsh && !sshClient.__netcattySingleChannelSsh) {
     const escapedPath = String(filePath).replace(/'/g, "'\\''");
     const digest = await executeBoundedSshCommand(
       sshClient,
@@ -950,7 +1040,7 @@ function stableLocalFileIdentity(statLike) {
 }
 
 async function promoteLocalTransfer(stagedPath, targetPath, options = {}) {
-  const { publishLocalFileExclusive } = require("./localFilePublish.cjs");
+  const { publishLocalFileExclusive, isMetadataUnsupportedError } = require("./localFilePublish.cjs");
   const assertNotCancelled = options.assertNotCancelled || (() => {});
   const token = crypto.randomUUID().replace(/-/g, "");
   const base = path.join(path.dirname(targetPath), `.${path.basename(targetPath)}.netcatty-${token}`);
@@ -960,6 +1050,7 @@ async function promoteLocalTransfer(stagedPath, targetPath, options = {}) {
   let backedUp = false;
   let committed = false;
   let keepRecoveryFiles = false;
+  let skipReadyCleanup = false;
   let preparedHandle;
   let originalHandle;
   let restoreProbeCreated = false;
@@ -970,7 +1061,28 @@ async function promoteLocalTransfer(stagedPath, targetPath, options = {}) {
       await fs.promises.rename(stagedPath, readyPath);
     } catch (error) {
       if (error?.code !== "EXDEV") throw error;
-      await fs.promises.copyFile(stagedPath, readyPath, fs.constants.COPYFILE_EXCL);
+      try {
+        await fs.promises.copyFile(stagedPath, readyPath, fs.constants.COPYFILE_EXCL);
+      } catch (copyError) {
+        if (!["ENOTSUP", "EOPNOTSUPP"].includes(copyError?.code)) throw copyError;
+        // copyFile includes metadata operations that writable GVFS mounts may
+        // reject. Reuse the exclusive bounded read/write publication path.
+        try {
+          await publishLocalFileExclusive(stagedPath, readyPath, assertNotCancelled, undefined, {
+            copyOnly: true, preserveMode: false, requireTimestamps: false,
+          });
+        } catch (fallbackError) {
+          // Do not remove a name this fallback never owned: copyFile may
+          // have left a partial, or an exclusive open may have lost a race.
+          skipReadyCleanup = true;
+          const cancelledBeforeOutput = !fallbackError.localPublicationIncomplete
+            && (fallbackError.code === "ABORT_ERR" || fallbackError.message === "Transfer cancelled");
+          // An early cancellation needs ordinary stage cleanup, not recovery.
+          // Once output exists, retain the complete stage as before.
+          keepRecoveryFiles = !cancelledBeforeOutput;
+          throw fallbackError;
+        }
+      }
     }
     // Stamp the private prepared file before applying possibly unreadable
     // destination permissions. Publication carries these times to the target.
@@ -995,7 +1107,17 @@ async function promoteLocalTransfer(stagedPath, targetPath, options = {}) {
         ? validatedTarget.existingMode & 0o7777
         : Number.isInteger(options.existingMode) ? options.existingMode & 0o7777 : null;
       if (mode !== null && mode !== appliedMode) {
-        await fs.promises.chmod(readyPath, mode);
+        if (((await preparedHandle.stat()).mode & 0o7777) !== mode) {
+          try {
+            await preparedHandle.chmod(mode);
+          } catch (error) {
+            if (!isMetadataUnsupportedError(error)
+              || ((await preparedHandle.stat()).mode & 0o7777) !== mode) throw error;
+          }
+          if (((await preparedHandle.stat()).mode & 0o7777) !== mode) {
+            throw new Error("Cannot preserve local destination permissions");
+          }
+        }
         appliedMode = mode;
         continue;
       }
@@ -1041,7 +1163,9 @@ async function promoteLocalTransfer(stagedPath, targetPath, options = {}) {
     assertNotCancelled();
     let publishedIdentity = null;
     try {
-      publishedIdentity = await publishLocalFileExclusive(readyPath, targetPath, assertNotCancelled, preparedHandle) ?? null;
+      publishedIdentity = await publishLocalFileExclusive(readyPath, targetPath, assertNotCancelled, preparedHandle, {
+        preserveMode: appliedMode !== null, requireTimestamps: false,
+      }) ?? null;
     } catch (error) {
       if (error?.code === "EEXIST") {
         throw new Error("Local download target changed during replacement", { cause: error });
@@ -1054,12 +1178,13 @@ async function promoteLocalTransfer(stagedPath, targetPath, options = {}) {
     committed = true;
     // Hand the published inode identity to the caller for descriptor-based
     // metadata stamping after publication.
-    options.onCommit?.(publishedIdentity, localMtimePrepared);
+    options.onCommit?.(publishedIdentity, localMtimePrepared && publishedIdentity?.timestampsPreserved !== false);
     if (backedUp) await fs.promises.unlink(backupPath).catch(() => {});
     await fs.promises.unlink(readyPath).catch(() => {});
     await fs.promises.unlink(stagedPath).catch(() => {});
   } catch (error) {
     if (committed) throw error;
+    if (error?.localPublicationIncomplete) keepRecoveryFiles = true;
     if (backedUp && !keepRecoveryFiles) {
       try {
         // The pathname may have changed between open and rename. Never copy
@@ -1089,7 +1214,7 @@ async function promoteLocalTransfer(stagedPath, targetPath, options = {}) {
       if (backedUp) failure.remoteBackupPath = backupPath;
       throw failure;
     }
-    await fs.promises.unlink(readyPath).catch(() => {});
+    if (!skipReadyCleanup) await fs.promises.unlink(readyPath).catch(() => {});
     throw error;
   } finally {
     await preparedHandle?.close().catch(() => {});
@@ -1175,7 +1300,7 @@ async function preserveTransferredDestinationMtime(transfer, options = {}) {
     if (isScpModeClient(client)) {
       // SCP has no SETSTAT; best-effort touch via the SSH session.
       const sshClient = client.client;
-      if (!sshClient || typeof sshClient.exec !== "function") return;
+      if (!sshClient || typeof sshClient.exec !== "function" || client.__netcattySingleChannelSsh || sshClient.__netcattySingleChannelSsh) return;
       const escaped = String(transfer.targetPath).replace(/'/g, "'\\''");
       const command = `touch -d @${mtimeSec} -- '${escaped}' 2>/dev/null || `
         + `touch -t "$(date -u -r ${mtimeSec} +%Y%m%d%H%M.%S 2>/dev/null `
@@ -1706,6 +1831,11 @@ function execSshCommandCancellable(sshClient, command, transfer) {
 }
 
 async function openIsolatedSftpChannel(client, signal = null) {
+  // The dedicated one-channel login already holds its only session channel.
+  // Opening another SFTP subsystem drops that login, so stay on the browse channel.
+  if (client?.__netcattySingleChannelSsh || client?.client?.__netcattySingleChannelSsh) {
+    return null;
+  }
   const sshClient = client?.client;
   return openBoundedSftpChannel(sshClient, { signal });
 }
@@ -2204,7 +2334,9 @@ async function uploadViaFastPut(localPath, remotePath, sftp, fileSize, transfer,
       return;
     }
 
-    sftp.fastPut(localPath, remotePath, {
+    // ssh2 resolves asar-ness via fs.open inside fastXfer (synchronous), so a
+    // scoped noAsar toggle makes real *.asar files readable (#3450).
+    fastPutLocal(sftp, localPath, remotePath, {
       chunkSize: TRANSFER_CHUNK_SIZE,
       concurrency: UPLOAD_TRANSFER_CONCURRENCY,
       step: (transferred, _chunk, total) => {
@@ -2274,8 +2406,11 @@ async function uploadFile(
       transfer,
       encoding,
       signal: transfer.signal,
-      openReadStream: () => {
-        const stream = fs.createReadStream(localPath, { highWaterMark: 256 * 1024 });
+      openReadStream: async () => {
+        // asarSafeFs: real *.asar sources must not be read as archives (#3450).
+        // Open the fd asynchronously (fs.promises.open) so a slow or
+        // unresponsive filesystem never blocks the main thread on fs.openSync.
+        const stream = await openLocalReadStream(localPath, { highWaterMark: 256 * 1024 });
         return { stream, completed: Promise.resolve() };
       },
       onProgress: (transferred, total) => sendProgress(transferred, total || fileSize),
@@ -2291,7 +2426,7 @@ async function uploadFile(
   transfer.pauseSupported = Boolean(transfer.resumable);
   const originalLocalPath = localPath;
   const initialSource = (transfer.resumable || !transfer.sourceIsOwnedTemp)
-    ? await fs.promises.stat(originalLocalPath)
+    ? await statLocal(originalLocalPath)
     : null;
 
   /** @type {Error | null} */
@@ -2307,7 +2442,7 @@ async function uploadFile(
 
   const finishSuccessfulUpload = async () => {
     if (initialSource) {
-      const latestSource = await fs.promises.stat(originalLocalPath);
+      const latestSource = await statLocal(originalLocalPath);
       // Soft size + mtime/ino (no full-file re-hash). Do not claim separate
       // content proof — same-size rewrites that bump mtime still fail closed.
       // ignoreCtime: macOS xattr/Spotlight noise must not abort a true match.
@@ -2923,6 +3058,10 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
         transfer.abort = previousAbort;
       }
       try { sftp.removeListener?.("error", onOpenChannelError); } catch { /* ignore */ }
+      if (!isWriteOpen) {
+        sftp.removeListener?.("end", onOpenChannelClosed);
+        sftp.removeListener?.("close", onOpenChannelClosed);
+      }
       fn(value);
     };
 
@@ -2979,6 +3118,10 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
       }
     };
 
+    const onOpenChannelClosed = () => {
+      onOpenChannelError(new Error("SFTP channel closed before the source file was opened"));
+    };
+
     if (transfer.cancelled) {
       completeSharedWriteDrain();
       releasePathGate();
@@ -2988,6 +3131,16 @@ function openSftpHandleForTransfer(sftp, filePath, flags, transfer, options = {}
 
     transfer.abort = abortDuringOpen;
     sftp.on?.("error", onOpenChannelError);
+    if (!isWriteOpen) {
+      sftp.on?.("end", onOpenChannelClosed);
+      sftp.on?.("close", onOpenChannelClosed);
+      // A failed isolated download may fall back after the browse channel's
+      // end event already fired. ssh2 never answers a new OPEN on that channel.
+      if (sftp.readable === false) {
+        onOpenChannelClosed();
+        return;
+      }
+    }
 
     try {
       sftp.open(filePath, resolveFlags(), (error, handle) => {
@@ -4435,7 +4588,8 @@ async function uploadFileConcurrent(
   try {
     if (transfer.cancelled) throw new Error("Transfer cancelled");
     try {
-      localHandle = await fs.promises.open(localPath, "r");
+      // asarSafeFs: real *.asar sources must not be opened as archives (#3450).
+      localHandle = await openLocal(localPath, "r");
     } catch (error) {
       failed = true;
       noTransferFallback = true;
@@ -5510,7 +5664,7 @@ async function startTransferNow(event, payload, onProgress) {
   const SOFT_RESUME_SAMPLE_BYTES = 256 * 1024;
   const readSourceSoftIdentity = async () => {
     if (sourceType === "local") {
-      const st = await fs.promises.stat(sourcePath);
+      const st = await statLocal(sourcePath);
       const sampleBytes = Math.min(SOFT_RESUME_SAMPLE_BYTES, Math.max(0, st.size));
       const sample = sampleBytes > 0
         ? await hashLocalPrefix(sourcePath, sampleBytes, { signal: transfer.signal })
@@ -5778,7 +5932,8 @@ async function startTransferNow(event, payload, onProgress) {
 
     if (!hasExplicitTotal) {
       if (sourceType === 'local') {
-        const stat = await fs.promises.stat(sourcePath);
+        // asarSafeFs: local *.asar sources stat as archive roots otherwise (#3450).
+        const stat = await statLocal(sourcePath);
         fileSize = stat.size;
       } else if (sourceType === 'sftp') {
         const client = sftpClients.get(sourceSftpId);
@@ -6166,7 +6321,8 @@ async function startTransferNow(event, payload, onProgress) {
         && srcClient
         && !cpUnavailableSet.has(srcClient)) {
         const sshClient = srcClient?.client;
-        if (sshClient && typeof sshClient.exec === 'function') {
+        const singleChannelCopy = srcClient.__netcattySingleChannelSsh || sshClient?.__netcattySingleChannelSsh;
+        if (sshClient && typeof sshClient.exec === 'function' && !singleChannelCopy) {
           try {
             const dir = path.dirname(targetPath).replace(/\\/g, '/');
             try {
@@ -7155,6 +7311,11 @@ async function sameHostCopyDirectory(event, payload) {
 
     const client = sftpClients.get(sftpId);
     if (!client) return { success: false };
+    // Remote cp needs an exec channel. That would drop a one-channel SFTP
+    // login, so the caller copies the directory one file at a time.
+    if (client.__netcattySingleChannelSsh || client.client?.__netcattySingleChannelSsh) {
+      return { success: false };
+    }
     if (cpUnavailableSet.has(client)) return { success: false };
 
     const sshClient = client.client;

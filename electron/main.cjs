@@ -76,6 +76,7 @@ const {
   collectSshDeepLinkQueueItems,
   getSshDeepLinkRendererReadyTimeoutMs,
   redactPuttyCommandLinePasswords,
+  redactSecureCrtCommandLinePasswords,
   isJmsDeepLinkUrl,
   isSshDeepLinkUrl,
   isTelnetDeepLinkUrl,
@@ -705,6 +706,8 @@ const pendingTelnetDeepLinkUrls = [...initialDeepLinkQueueItems.telnet];
 // redacted copy would make warm PuTTY-style launches authenticate with the
 // masked password.
 const rawLaunchArgvForHandoff = [...process.argv];
+// SecureCRT operands may contain PuTTY switch names; scrub them first.
+redactSecureCrtCommandLinePasswords(process.argv);
 redactPuttyCommandLinePasswords(process.argv);
 const pendingOpenTerminalPaths = resolveOpenTerminalPathsFromArgs(process.argv);
 let flushingSshDeepLinks = false;
@@ -720,19 +723,19 @@ let jmsDeepLinkDeliveryGeneration = 0;
 
 let explorerContextMenuEnabled = resolveExplorerContextMenuEnabled({ app }).enabled === true;
 
-function queueSshDeepLink(rawUrl, { viaCommandLine = false } = {}) {
+function queueSshDeepLink(rawUrl, { viaCommandLine = false, tabName } = {}) {
   if (!viaCommandLine && !sshDeepLinkEnabled) return;
   if (!isSshDeepLinkUrl(rawUrl)) return;
-  pendingSshDeepLinkUrls.push({ rawUrl, viaCommandLine });
+  pendingSshDeepLinkUrls.push({ rawUrl, viaCommandLine, ...(tabName ? { tabName } : {}) });
   if (app.isReady?.()) {
     void flushPendingSshDeepLinks();
   }
 }
 
-function queueTelnetDeepLink(rawUrl, { viaCommandLine = false } = {}) {
+function queueTelnetDeepLink(rawUrl, { viaCommandLine = false, tabName } = {}) {
   if (!viaCommandLine && !sshDeepLinkEnabled) return;
   if (!isTelnetDeepLinkUrl(rawUrl)) return;
-  pendingTelnetDeepLinkUrls.push({ rawUrl, viaCommandLine });
+  pendingTelnetDeepLinkUrls.push({ rawUrl, viaCommandLine, ...(tabName ? { tabName } : {}) });
   if (app.isReady?.()) {
     void flushPendingTelnetDeepLinks();
   }
@@ -932,7 +935,7 @@ async function flushPendingJmsDeepLinks() {
   }
 }
 
-async function deliverSshDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false } = {}) {
+async function deliverSshDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false, tabName } = {}) {
   // The ssh:// preference can flip while a delivery is waiting for the
   // renderer, so re-check it at every gate instead of reusing the queue-time
   // snapshot. Command-line (PuTTY-style) launches bypass the preference.
@@ -955,7 +958,7 @@ async function deliverSshDeepLink(rawUrl, expectedGeneration = sshSchemeDelivery
   const result = await windowManager.sendWhenRendererReady?.(
     win,
     SSH_DEEP_LINK_CHANNEL,
-    { url: rawUrl },
+    { url: rawUrl, ...(tabName ? { tabName } : {}) },
     {
       timeoutMs: getSshDeepLinkRendererReadyTimeoutMs({ isDev }),
       shouldSend: shouldDeliver,
@@ -968,7 +971,7 @@ async function deliverSshDeepLink(rawUrl, expectedGeneration = sshSchemeDelivery
   return result || { success: true };
 }
 
-async function deliverTelnetDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false } = {}) {
+async function deliverTelnetDeepLink(rawUrl, expectedGeneration = sshSchemeDeliveryGeneration, { viaCommandLine = false, tabName } = {}) {
   // Mirror deliverSshDeepLink: gate on the live preference so disabling
   // protocol handling cancels in-flight scheme deliveries, while
   // command-line launches stay deliverable.
@@ -985,7 +988,7 @@ async function deliverTelnetDeepLink(rawUrl, expectedGeneration = sshSchemeDeliv
   const result = await windowManager.sendWhenRendererReady?.(
     win,
     TELNET_DEEP_LINK_CHANNEL,
-    { url: rawUrl },
+    { url: rawUrl, ...(tabName ? { tabName } : {}) },
     {
       timeoutMs: 0,
       shouldSend: shouldDeliver,
@@ -1012,6 +1015,7 @@ async function flushPendingSshDeepLinks() {
       const expectedGeneration = sshSchemeDeliveryGeneration;
       const result = await deliverSshDeepLink(item.rawUrl, expectedGeneration, {
         viaCommandLine: item.viaCommandLine === true,
+        tabName: item.tabName,
       });
       if (shouldRequeueFailedSshDeepLinkDelivery({
         enabled: item.viaCommandLine === true || sshDeepLinkEnabled,
@@ -1057,6 +1061,7 @@ async function flushPendingTelnetDeepLinks() {
       const expectedGeneration = sshSchemeDeliveryGeneration;
       const result = await deliverTelnetDeepLink(item.rawUrl, expectedGeneration, {
         viaCommandLine: item.viaCommandLine === true,
+        tabName: item.tabName,
       });
       if (shouldRequeueFailedSshDeepLinkDelivery({
         enabled: item.viaCommandLine === true || sshDeepLinkEnabled,
@@ -1243,6 +1248,7 @@ if (!gotLock) {
     const deepLinkQueueItems = collectSshDeepLinkQueueItems(secondInstanceArgv, {
       includeSchemeUrls: sshDeepLinkEnabled,
     });
+    redactSecureCrtCommandLinePasswords(secondInstanceArgv);
     redactPuttyCommandLinePasswords(secondInstanceArgv);
     if (rawLaunchArgv) {
       // Parsing and subsequent routing use the independent ordered copy.
@@ -1259,13 +1265,13 @@ if (!gotLock) {
     }
     if (deepLinkQueueItems.telnet.length > 0) {
       deepLinkQueueItems.telnet.forEach((item) => {
-        queueTelnetDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine });
+        queueTelnetDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine, tabName: item.tabName });
       });
       return;
     }
     if (deepLinkQueueItems.ssh.length > 0) {
       deepLinkQueueItems.ssh.forEach((item) => {
-        queueSshDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine });
+        queueSshDeepLink(item.rawUrl, { viaCommandLine: item.viaCommandLine, tabName: item.tabName });
       });
       return;
     }

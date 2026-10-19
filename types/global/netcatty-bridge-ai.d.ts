@@ -29,7 +29,7 @@ declare global {
       acpArgs?: string[];
     }>>;
     aiPrewarmShellEnv?(): Promise<{ ok: boolean; error?: string }>;
-    aiCodexGetIntegration?(options?: { refreshShellEnv?: boolean; validateChatGptAuth?: boolean; codexPath?: string }): Promise<{
+    aiCodexGetIntegration?(options?: { refreshShellEnv?: boolean; validateChatGptAuth?: boolean; codexPath?: string; agentEnv?: Record<string, string> }): Promise<{
       state: 'connected_chatgpt' | 'connected_api_key' | 'connected_custom_config' | 'not_logged_in' | 'unknown';
       isConnected: boolean;
       rawOutput: string;
@@ -45,7 +45,7 @@ declare global {
         authHash: string | null;
       } | null;
     }>;
-    aiCodexStartLogin?(options?: { codexPath?: string }): Promise<{
+    aiCodexStartLogin?(options?: { codexPath?: string; agentEnv?: Record<string, string> }): Promise<{
       ok: boolean;
       session?: {
         sessionId: string;
@@ -85,7 +85,7 @@ declare global {
       };
       error?: string;
     }>;
-    aiCodexLogout?(options?: { codexPath?: string }): Promise<{
+    aiCodexLogout?(options?: { codexPath?: string; agentEnv?: Record<string, string> }): Promise<{
       ok: boolean;
       state?: 'connected_chatgpt' | 'connected_api_key' | 'connected_custom_config' | 'not_logged_in' | 'unknown';
       isConnected?: boolean;
@@ -197,7 +197,7 @@ declare global {
       message?: string;
       turnKind?: 'review' | 'compact';
     }>;
-    aiSdkAgentListModels?(sdkBackend: string, cwd?: string, providerId?: string, chatSessionId?: string, agentEnv?: Record<string, string>, agentCommand?: string, codexRuntime?: 'sdk' | 'app-server'): Promise<{ ok: boolean; models?: Array<{ id: string; name: string; description?: string; thinkingLevels?: string[]; defaultThinkingLevel?: string }>; currentModelId?: string | null; warning?: string; error?: string }>;
+    aiSdkAgentListModels?(sdkBackend: string, cwd?: string, providerId?: string, chatSessionId?: string, agentEnv?: Record<string, string>, agentCommand?: string, codexRuntime?: 'sdk' | 'app-server'): Promise<{ ok: boolean; models?: Array<{ id: string; name: string; description?: string; thinkingLevels?: string[]; defaultThinkingLevel?: string }>; currentModelId?: string | null; warning?: string; source?: 'live' | 'last-known-good'; fetchedAt?: string; error?: string }>;
     codexAppServerGetStatus?(agentCommand?: string, agentEnv?: Record<string, string>): Promise<{ ok: boolean; available: boolean; error?: string }>;
     onCodexAppServerInteractionRequest?(cb: (payload: Record<string, unknown>) => void): () => void;
     onCodexAppServerInteractionCleared?(cb: (payload: { interactionIds: string[]; chatSessionId?: string }) => void): () => void;
@@ -231,6 +231,11 @@ declare global {
       idleTimeoutMinutes?: number;
       sessionIdleTimeoutMinutes?: number;
     }): Promise<Record<string, unknown>>;
+    externalMcpGetUniversalSetupPrompt?(): Promise<{
+      ok: boolean;
+      prompt?: string;
+      error?: string | null;
+    }>;
     externalMcpCodexGetStatus?(): Promise<Record<string, unknown>>;
     externalMcpCodexAdd?(): Promise<Record<string, unknown>>;
     externalMcpClaudeGetStatus?(): Promise<Record<string, unknown>>;

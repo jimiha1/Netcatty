@@ -26,7 +26,8 @@ import {
 } from "../../domain/hostClickBehavior";
 import type { GroupNode, Host } from "../../domain/models";
 import { isPluginHostProtocol } from "../../domain/pluginConnection";
-import { OpenDualPaneSftpMenuItem } from "../host/HostTreeContextMenus";
+import { OpenDualPaneSftpMenuItem, OpenHostBrowserMenuItem } from "../host/HostTreeContextMenus";
+import { getVaultHostRowSubtitle } from "../../domain/localShellHost";
 
 type VaultHostListSectionContext = Record<string, any>;
 
@@ -55,7 +56,7 @@ const isRelatedTargetInside = (
 const EMPTY_GROUP_PATH_SET = new Set<string>();
 
 export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext }) {
-  const { Badge, Boolean, Button, cancelInlineGroupEdit, CheckSquare, ClipboardCopy, Clock, cn, commitInlineGroupRename, ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger, Copy, displayedGroups, displayedHosts, DistroAvatar, Edit2, FileSymlink, FolderPlus, FolderTree, getDropTargetClasses, getEffectiveHostDistro, groupConfigs, groupedDisplayHosts, handleCopyCredentials, handleCopyHostname, handleDuplicateHost, handleEditGroupConfig, handleEditHost, handleHostConnect, hostClickBehavior: hostClickBehaviorProp, handleUnmanageGroup, hasHostsSidePanel, hostListScrollRef, HostTreeView, isHostsSectionActive, isMultiSelectMode, lastPinnedId, LayoutGrid, managedGroupPaths, moveGroup, moveHostToGroup, onDeleteHost, Pin, pinnedHosts, Plug, recentHosts, reorderGroup, reorderHost, sanitizeHost, search, selectedGroupPath, selectedGroupPaths, selectedHostIds, selectedTags, sessionCount, setDeleteTargetPath, setDragOverDropTarget, setGroupDragOverDropTarget, setIsDeleteGroupOpen, setIsNewFolderOpen, setLastPinnedId, setNewFolderName, setSelectedGroupPath, setTargetParentPath, shouldHideEmptyRootHostsSection, showRecentHosts, sortMode, Square, Star, startInlineDeleteGroup, startInlineNewGroup, startInlineRenameGroup, t, toggleGroupSelection, toggleHostPinned, toggleHostSelection, Trash2, treeExpandedState, treeViewGroupTree, treeViewHosts, viewMode, visibleDisplayedHosts } = ctx;
+  const { Badge, Boolean, Button, cancelInlineGroupEdit, CheckSquare, ClipboardCopy, Clock, cn, commitInlineGroupRename, ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger, Copy, displayedGroups, displayedHosts, DistroAvatar, Edit2, FileSymlink, FolderPlus, FolderTree, getDropTargetClasses, getEffectiveHostDistro, groupConfigs, groupedDisplayHosts, handleCopyCredentials, handleCopyHostname, handleDuplicateHost, handleEditGroupConfig, handleEditHost, handleHostConnect, handleOpenHostBrowser, hostClickBehavior: hostClickBehaviorProp, handleUnmanageGroup, hasHostsSidePanel, hostListScrollRef, HostTreeView, isHostsSectionActive, isMultiSelectMode, lastPinnedId, LayoutGrid, managedGroupPaths, moveGroup, moveHostToGroup, onDeleteHost, Pin, pinnedHosts, Plug, recentHosts, reorderGroup, reorderHost, sanitizeHost, search, selectedGroupPath, selectedGroupPaths, selectedHostIds, selectedTags, sessionCount, setDeleteTargetPath, setDragOverDropTarget, setGroupDragOverDropTarget, setIsDeleteGroupOpen, setIsNewFolderOpen, setLastPinnedId, setNewFolderName, setSelectedGroupPath, setTargetParentPath, shouldHideEmptyRootHostsSection, showRecentHosts, sortMode, Square, Star, startInlineDeleteGroup, startInlineNewGroup, startInlineRenameGroup, t, toggleGroupSelection, toggleHostPinned, toggleHostSelection, Trash2, treeExpandedState, treeViewGroupTree, treeViewHosts, viewMode, visibleDisplayedHosts } = ctx;
   const hostClickBehavior: HostClickBehavior = hostClickBehaviorProp === 'select' ? 'select' : 'connect';
   const multiSelectedGroupPaths: Set<string> = selectedGroupPaths ?? EMPTY_GROUP_PATH_SET;
   const [draggingHostId, setDraggingHostId] = React.useState<string | null>(null);
@@ -598,7 +599,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                                         <HostNotesIndicator notes={safeHost.notes} />
                                       </div>
                                       <div className="text-[11px] text-muted-foreground font-mono truncate leading-4">
-                                        {safeHost.username}@{safeHost.hostname}
+                                        {getVaultHostRowSubtitle(safeHost, { localFallback: t('localShell.subtitle') })}
                                       </div>
                                     </div>
                                     {viewMode === "grid" && renderHostEditButton(host)}
@@ -610,6 +611,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                                   <Plug className="mr-2 h-4 w-4" /> {t('vault.hosts.connect')}
                                 </ContextMenuItem>
                                 <OpenDualPaneSftpMenuItem host={host} />
+                                <OpenHostBrowserMenuItem host={host} onOpenBrowser={handleOpenHostBrowser} />
                                 <ContextMenuItem onClick={() => handleEditHost(host)}>
                                   <Edit2 className="mr-2 h-4 w-4" /> {t('action.edit')}
                                 </ContextMenuItem>
@@ -718,7 +720,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                                         <HostNotesIndicator notes={safeHost.notes} />
                                       </div>
                                       <div className="text-[11px] text-muted-foreground font-mono truncate leading-4">
-                                        {safeHost.username}@{safeHost.hostname}
+                                        {getVaultHostRowSubtitle(safeHost, { localFallback: t('localShell.subtitle') })}
                                       </div>
                                     </div>
                                     {viewMode === "grid" && renderHostEditButton(host)}
@@ -730,6 +732,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                                   <Plug className="mr-2 h-4 w-4" /> {t('vault.hosts.connect')}
                                 </ContextMenuItem>
                                 <OpenDualPaneSftpMenuItem host={host} />
+                                <OpenHostBrowserMenuItem host={host} onOpenBrowser={handleOpenHostBrowser} />
                                 <ContextMenuItem onClick={() => handleEditHost(host)}>
                                   <Edit2 className="mr-2 h-4 w-4" /> {t('action.edit')}
                                 </ContextMenuItem>
@@ -893,6 +896,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                                 <div className="flex-1 min-w-0">
                                   <div className="text-sm font-semibold flex items-center gap-1.5 min-w-0">
                                     <span className="truncate">{node.name}</span>
+                                    <HostNotesIndicator notes={groupConfigs.find((config) => config.path === node.path)?.notes} label="Group notes" />
                                     {!isMultiSelectMode && viewMode !== "grid" && renderGroupEditButton(node.path, true)}
                                     {managedGroupPaths.has(node.path) && (
                                       <span className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded bg-primary/15 text-primary shrink-0">
@@ -965,6 +969,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                       onExpandAll={treeExpandedState.expandAll}
                       onCollapseAll={treeExpandedState.collapseAll}
                       onConnect={handleHostConnect}
+                      onOpenBrowser={handleOpenHostBrowser}
                       onEditHost={handleEditHost}
                       onDuplicateHost={handleDuplicateHost}
                       onDeleteHost={handleTreeDeleteHost}
@@ -1096,7 +1101,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                                               <HostNotesIndicator notes={safeHost.notes} />
                                             </div>
                                             <div className="text-[11px] text-muted-foreground font-mono truncate leading-4">
-                                              {safeHost.username}@{safeHost.hostname}
+                                              {getVaultHostRowSubtitle(safeHost, { localFallback: t('localShell.subtitle') })}
                                             </div>
                                           </div>
                                           {viewMode === "grid" && renderHostEditButton(host)}
@@ -1110,6 +1115,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                                         <Plug className="mr-2 h-4 w-4" /> {t('vault.hosts.connect')}
                                       </ContextMenuItem>
                                       <OpenDualPaneSftpMenuItem host={host} />
+                                      <OpenHostBrowserMenuItem host={host} onOpenBrowser={handleOpenHostBrowser} />
                                       <ContextMenuItem
                                         onClick={() => handleEditHost(host)}
                                       >
@@ -1246,7 +1252,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                                         <HostNotesIndicator notes={safeHost.notes} />
                                       </div>
                                       <div className="text-[11px] text-muted-foreground font-mono truncate leading-4">
-                                        {safeHost.username}@{safeHost.hostname}
+                                        {getVaultHostRowSubtitle(safeHost, { localFallback: t('localShell.subtitle') })}
                                       </div>
                                     </div>
                                     {viewMode === "grid" && renderHostEditButton(host)}
@@ -1260,6 +1266,7 @@ export function VaultHostListSection({ ctx }: { ctx: VaultHostListSectionContext
                                   <Plug className="mr-2 h-4 w-4" /> {t('vault.hosts.connect')}
                                 </ContextMenuItem>
                                 <OpenDualPaneSftpMenuItem host={host} />
+                                <OpenHostBrowserMenuItem host={host} onOpenBrowser={handleOpenHostBrowser} />
                                 <ContextMenuItem
                                   onClick={() => handleEditHost(host)}
                                 >

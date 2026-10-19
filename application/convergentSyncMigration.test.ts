@@ -1,8 +1,11 @@
+import { installBrowserLockFixture } from "./testSupport/browserLockFixture";
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import type { SyncPayload } from '../domain/sync.ts';
 import type { CloudSyncManager } from '../infrastructure/services/CloudSyncManager.ts';
+
+installBrowserLockFixture();
 
 const NOW = 1_700_000_000_000;
 const localStorageValues = new Map<string, string>();
@@ -136,7 +139,7 @@ test('initialization applies the protected preview before persisting and enablin
       return liveLocalPayload;
     },
     translateProtectiveBackupFailure: (message) => message,
-    applyPayload: async (incoming) => {
+    preparePayloadApply: async (incoming) => async () => {
       calls.push('apply');
       assert.equal(incoming.convergentSync?.schemaVersion, 2);
     },
@@ -212,7 +215,7 @@ test('initialization applies a concurrent provider merge before releasing the mi
     buildCurrentPayload: () => currentPayload,
     buildPreApplyPayload: () => currentPayload,
     translateProtectiveBackupFailure: (message) => message,
-    applyPayload: async (incoming) => {
+    preparePayloadApply: async (incoming) => async () => {
       assert.equal(lockHeld, true);
       applied.push(incoming);
       currentPayload = stripConvergentSyncEnvelope(incoming);
@@ -265,7 +268,7 @@ test('initialization rejects a stale preview before backup or apply', async () =
       buildCurrentPayload: () => changedPayload,
       buildPreApplyPayload: () => changedPayload,
       translateProtectiveBackupFailure: (message) => message,
-      applyPayload: () => {
+      preparePayloadApply: async () => async () => {
         applied = true;
       },
       runProtectedApply: async (options) => {
@@ -300,7 +303,7 @@ test('blocked previews cannot enter the protected initialization transaction', a
       buildCurrentPayload: () => localPayload,
       buildPreApplyPayload: () => localPayload,
       translateProtectiveBackupFailure: (message) => message,
-      applyPayload: () => {},
+      preparePayloadApply: async () => async () => {},
       runProtectedApply: async () => {
         entered = true;
       },
@@ -337,7 +340,7 @@ test('a locked manager cannot enter the protected initialization transaction', a
         return localPayload;
       },
       translateProtectiveBackupFailure: (message) => message,
-      applyPayload: () => {
+      preparePayloadApply: async () => async () => {
         applied = true;
       },
       runProtectedApply: async () => {
@@ -352,3 +355,56 @@ test('a locked manager cannot enter the protected initialization transaction', a
   assert.equal(applied, false);
   assert.deepEqual(getConvergentSyncLocalConfig(), { enabled: false, initialized: false });
 });
+
+for (const failDuringPublish of [false, true]) {
+  test(`migration header failure precedes protected writes (${failDuringPublish ? 'publish' : 'initialize'})`, async () => {
+    const { prepareSyncPayloadApply } = await import('./syncPayload.ts');
+    const { readInterruptedVaultApply } = await import('./localVaultBackups.ts');
+    const headers = { ai: { providers: [{ id: 'custom', customHeaders: { 'X-Tenant': 'secret' } }] } };
+    const localPayload: SyncPayload = { ...payload(), ...(failDuringPublish ? {} : { settings: headers }) };
+    let currentPayload = localPayload;
+    let imports = 0;
+    let replicaCommits = 0;
+    let snapshots = 0;
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: {
+      netcatty: { credentialsEncrypt: async () => {
+        assert.equal(readInterruptedVaultApply(), null);
+        throw new Error('keychain locked');
+      } },
+      dispatchEvent: () => true,
+    } });
+    const plan = planConvergentSyncMigration({
+      localPayload, localTrustedBaseline: null, providers: [], deviceId: 'device-a', now: NOW,
+    });
+    const manager = {
+      isUnlocked: () => true,
+      withConvergentSyncLock: async (task: () => Promise<void>) => task(),
+      saveConvergentReplica: async () => { replicaCommits++; },
+      saveConvergentProviderBaseline: async () => {},
+      syncConvergentProvidersUnderLock: async (
+        _incoming: SyncPayload,
+        apply: (incoming: SyncPayload, commit: () => Promise<void>) => Promise<void>,
+      ) => {
+        await apply({ ...currentPayload, settings: headers }, async () => { replicaCommits++; });
+        return new Map();
+      },
+    } as unknown as CloudSyncManager;
+    await assert.rejects(initializePreparedConvergentMigration({
+      prepared: { plan, providerBaselines: [], localSnapshot: localPayload }, manager, now: NOW,
+      buildCurrentPayload: () => currentPayload,
+      buildPreApplyPayload: () => { snapshots++; return payload(); },
+      translateProtectiveBackupFailure: (message) => message,
+      preparePayloadApply: async (incoming) => {
+        const apply = await prepareSyncPayloadApply(incoming, { importVaultData: () => { imports++; } });
+        return async () => {
+          await apply();
+          currentPayload = stripConvergentSyncEnvelope(incoming);
+        };
+      },
+    }));
+    assert.equal(readInterruptedVaultApply(), null);
+    assert.equal(imports, failDuringPublish ? 1 : 0);
+    assert.equal(replicaCommits, failDuringPublish ? 1 : 0);
+    assert.equal(snapshots, failDuringPublish ? 1 : 0);
+  });
+}

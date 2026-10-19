@@ -19,6 +19,7 @@ import {
   applyResponsesApiStatelessStoreOption,
   buildCattyReasoningProviderOptions,
   estimateReasoningOutputReserve,
+  resolveEffectiveCattyReasoningEffort,
 } from '../../cattyReasoning';
 import { createModelFromConfig } from '../../sdk/providers';
 import { createCattyToolsFromCatalog } from '../capabilityTools';
@@ -36,7 +37,6 @@ import {
   buildCattySdkMessages,
   collectOpenAIChatAssistantFieldsForMessages,
   collectPreservedTerminalWriteFingerprints,
-  collectToolResultsAfterMessage,
   createContinuationContext,
 } from './cattyMessageBuilder';
 import { hadToolProgressBeforeRequestTooLarge, processCattyStream } from './cattyStreamProcessor';
@@ -217,7 +217,6 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
     const buildSdkMessages = (
       allMessages: import('../../types').ChatMessage[],
       includeCurrentUserMessage: boolean,
-      options: { preserveTerminalToolResults?: ReadonlySet<import('../../types').ToolResult> } = {},
       sessionContextCompaction = currentSession?.contextCompaction,
     ) => buildCattySdkMessages({
       allMessages,
@@ -226,7 +225,6 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
       trimmed: modelUserText,
       attachments: includeCurrentUserMessage ? attachments : undefined,
       continuationContext,
-      preserveTerminalToolResults: options.preserveTerminalToolResults,
       chatSessionId: sessionId,
       toolOutputStore: ctx.toolOutputStore,
       fieldsByMessage: openAIChatAssistantFieldsByMessage,
@@ -247,6 +245,7 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
         {
           getOpenAIChatAssistantFields: () => continuationContext.openAIChatAssistantFields,
           streamIdleTimeoutMs: responseIdleTimeoutMs,
+          chatSessionId: sessionId,
         },
       );
     } catch (e) {
@@ -265,11 +264,24 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
       context.activeProvider,
       buildCattyReasoningProviderOptions(
         context.activeProvider,
-        context.reasoningEffort,
+        resolveEffectiveCattyReasoningEffort(
+          context.reasoningEffort,
+          context.activeProvider?.advancedParams?.reasoningEffort,
+        ),
         activeModelId,
       ),
     );
     const preserveStatelessResponsesReasoning = reasoningProviderOptions?.openai?.store === false;
+    // Anthropic-compatible providers validate signed thinking blocks: every
+    // content[type=thinking] block (with its signature) captured on prior
+    // assistant turns must be echoed back verbatim on subsequent requests that
+    // carry tools, or the API rejects the turn with "The `content[].thinking`
+    // in the thinking mode must be passed back to the API" (DeepSeek's
+    // Anthropic-format endpoint is strict about this even for earlier turns).
+    // Keep the reasoning parts buildCattySdkMessages replayed instead of
+    // pruning them like generic Chat Completions histories.
+    const preserveAnthropicThinkingReplay = resolveProviderStyle(context.activeProvider) === 'anthropic';
+    const preserveReasoningForStream = preserveStatelessResponsesReasoning || preserveAnthropicThinkingReplay;
     const reasoningReserveTokens = estimateReasoningOutputReserve(reasoningProviderOptions);
     // Fold thinking budget into compaction maxOutput only. reservedTokens is
     // added to estimated input separately, so adding the budget there too
@@ -285,7 +297,7 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
 
     const prepareMessagesForStream = (messages: ModelMessage[]): ModelMessage[] => {
       const pruned = prepareCattyMessagesForStream(messages, {
-        preserveReasoning: preserveStatelessResponsesReasoning,
+        preserveReasoning: preserveReasoningForStream,
       });
       continuationContext.openAIChatAssistantFields = collectOpenAIChatAssistantFieldsForMessages(
         pruned,
@@ -384,7 +396,6 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
       const headSdkMessages = buildSdkMessages(
         uiMessages.slice(0, compactedMessageCount),
         false,
-        {},
         undefined,
       );
       const compacted = await compactMessages(headSdkMessages, {
@@ -399,7 +410,7 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
         };
         ui.persistContextCompaction?.(sessionId, nextCompaction);
         emitContextSnapshot(prepareMessagesForStream(
-          buildSdkMessages(uiMessages, false, {}, nextCompaction),
+          buildSdkMessages(uiMessages, false, nextCompaction),
         ));
       } else {
         // Non-durable outcome: keep the meter honest (full current context).
@@ -437,6 +448,7 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
       await processCattyStream({
         streamSessionId: sessionId,
         model,
+        providerConfig: context.activeProvider,
         systemPrompt,
         toolsBundle,
         sdkMessages: streamMessages,
@@ -499,12 +511,7 @@ async function runCattyTurn(input: CattyTurnInput, ctx: TurnDriverContext): Prom
             assistantMsgId,
             sessionId,
           );
-          retryBaseMessages = buildSdkMessages(latestSession.messages, false, {
-            preserveTerminalToolResults: collectToolResultsAfterMessage(
-              latestSession.messages,
-              assistantMsgId,
-            ),
-          }, latestSession.contextCompaction);
+          retryBaseMessages = buildSdkMessages(latestSession.messages, false, latestSession.contextCompaction);
         }
         retryAssistantMsgId = generateId();
         ui.addMessageToSession(sessionId, {

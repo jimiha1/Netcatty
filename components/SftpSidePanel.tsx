@@ -31,10 +31,12 @@ import {
 import { useSftpFollowTerminalCwd } from "../application/state/sftp/useSftpFollowTerminalCwd";
 import { usePendingSftpUploadRebind } from "../application/state/sftp/usePendingSftpUploadRebind";
 import { registerEditorSftpWriterScoped } from "../application/state/editorSftpBridge";
+import { registerEditorSftpOwnerResolver } from "../application/state/editorSftpOwnerRegistry";
 import {
   editorTabStore,
   useEditorTabPresenceRevision,
 } from "../application/state/editorTabStore";
+import { forceCloseOwnedEditors } from "../application/state/editorWindowClient";
 import { releaseEditorTabSaveCoordinator } from "../application/state/editorTabSave";
 import { useSftpBackend } from "../application/state/useSftpBackend";
 import { useSftpFileAssociations } from "../application/state/useSftpFileAssociations";
@@ -75,6 +77,7 @@ import {
   resolveLocateSftpPathSessionId,
 } from "../domain/sftpLocatePathInTerminal";
 import { classifyDistroId } from "../domain/host";
+import { remoteSoftwareRequiresSingleChannel } from "../domain/singleChannelSshBanner.shared.mjs";
 import { useTerminalBackend } from "../application/state/useTerminalBackend";
 import { isTerminalSensitiveInputActive } from "./terminal/runtime/terminalSensitiveInputRegistry";
 import { isTerminalReadyForCommandInjection } from "./terminal/runtime/terminalCommandInjectionReadyRegistry";
@@ -94,6 +97,8 @@ import {
   shouldCancelSettledPendingSftpRebindWithoutTarget,
   shouldDeferPendingSftpUploadForOriginFocus,
   shouldDeferSftpSidePanelAutoConnectForSession,
+  isSplitFocusSftpStillConnected,
+  shouldKeepConnectedSftpOnSplitFocus,
   shouldRebindSftpSidePanelSourceSession,
   shouldSkipSftpSidePanelAutoConnect,
   shouldStartPendingSftpUploadRebind,
@@ -147,6 +152,9 @@ interface SftpSidePanelProps {
    * focused). Keeps browse SFTP sessions warm across History/System switches.
    */
   ownerPanelOpen?: boolean;
+  /** Top-level tab id hosting this panel (terminal/workspace tab), used to
+   * resolve which tab owns an editor's SFTP connection. */
+  ownerTabId?: string | null;
   renderOverlays?: boolean;
   pendingUpload?: {
     requestId: string;
@@ -201,6 +209,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   showWorkspaceHostHeader = false,
   isVisible = true,
   ownerPanelOpen = false,
+  ownerTabId = null,
   renderOverlays = true,
   pendingUpload = null,
   onPendingUploadHandled,
@@ -341,6 +350,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     listLocalDir,
     listDrives,
     openPath,
+    statSftp,
   } = useSftpBackend();
 
   const sftpRef = useRef(sftp);
@@ -478,6 +488,32 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     );
   }, []);
 
+  const ownerTabIdRef = useRef(ownerTabId);
+  ownerTabIdRef.current = ownerTabId;
+
+  // While mounted, report which SFTP connections this panel owns and which
+  // top-level tab hosts it, so batch-close logic can keep the owning tab open
+  // when an editor bound to one of those connections survives its close
+  // prompt. Intentionally no deps — go through sftpRef so connection churn
+  // doesn't register/unregister on every re-render.
+  useEffect(() => {
+    return registerEditorSftpOwnerResolver(() => {
+      const s = sftpRef.current;
+      if (!s) return { connectionIds: [], ownerTabId: ownerTabIdRef.current };
+      const connectionIds: string[] = [];
+      const paneTabIds: string[] = [];
+      for (const tab of [...(s.leftTabs?.tabs ?? []), ...(s.rightTabs?.tabs ?? [])]) {
+        const id = tab.connection?.id;
+        if (id) connectionIds.push(id);
+        // Pane tab ids are stable across browse reconnects (unlike connection
+        // ids), so owner resolution can match editors bound to a stale
+        // pre-reconnect connection id.
+        if (tab.id) paneTabIds.push(tab.id);
+      }
+      return { connectionIds, paneTabIds, ownerTabId: ownerTabIdRef.current };
+    });
+  }, []);
+
   // When this side panel unmounts (its hosting terminal tab was closed) we
   // force-close any editor tabs bound to connections this panel owned — the
   // save channel is gone with the SFTP session and there's no way to recover
@@ -499,7 +535,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
         if (id) ownedSessionIds.push(id);
       }
       if (ownedSessionIds.length === 0 && ownedSftpTabIds.length === 0) return;
-      const closed = editorTabStore.forceCloseByOwners({
+      const closed = forceCloseOwnedEditors({
         sessionIds: ownedSessionIds,
         sftpTabIds: ownedSftpTabIds,
       });
@@ -538,6 +574,41 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   const lastBrowsedPathByConnectionKeyRef = useRef<Map<string, string>>(new Map());
   const [interactiveWorkActive, setInteractiveWorkActive] = useState(false);
   const [sftpUiReady, setSftpUiReady] = useState(false);
+  const terminalBackend = useTerminalBackend();
+  const [sftpBannerDecision, setSftpBannerDecision] = useState<{
+    sessionId: string;
+    singleChannel: boolean;
+  } | null>(null);
+  const activeSessionStatusForBanner = activeSessionId
+    ? sessions.find((session) => session.id === activeSessionId)?.status ?? null
+    : null;
+
+  useEffect(() => {
+    if (!activeSessionId || activeSessionStatusForBanner !== "connected") {
+      setSftpBannerDecision(null);
+      return;
+    }
+    const readRemoteInfo = terminalBackend.getSessionRemoteInfo;
+    if (!readRemoteInfo) {
+      setSftpBannerDecision({ sessionId: activeSessionId, singleChannel: false });
+      return;
+    }
+    let cancelled = false;
+    void readRemoteInfo(activeSessionId).then((info) => {
+      if (cancelled) return;
+      setSftpBannerDecision({
+        sessionId: activeSessionId,
+        singleChannel: remoteSoftwareRequiresSingleChannel(info?.remoteSshVersion),
+      });
+    }).catch(() => {
+      if (!cancelled) {
+        setSftpBannerDecision({ sessionId: activeSessionId, singleChannel: false });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId, activeSessionStatusForBanner, terminalBackend]);
 
   useEffect(() => {
     pruneSftpSidePanelState(
@@ -661,6 +732,16 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
       previousStatus: lastSourceSessionStatusRef.current,
       nextStatus: activeSessionStatus ?? (activeSessionId ? "connected" : null),
     });
+    // The peer banner is known only after the terminal handshake. Wait for it
+    // before choosing a shared terminal channel, so a one-channel bastion
+    // dials its file login directly.
+    if (
+      activeSessionId
+      && activeSessionStatus === "connected"
+      && sftpBannerDecision?.sessionId !== activeSessionId
+    ) {
+      return;
+    }
 
     const hasBackendSession = (connectionId: string) => !!s.getSftpIdForConnection(connectionId);
     const activeTab = s.leftTabs.tabs.find((tab) => tab.id === s.leftTabs.activeTabId) ?? null;
@@ -676,16 +757,33 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     // Rebind when the focused terminal SSH session changes: saved host keys can
     // lag live session endpoints (edited host / unsaved user). Still keep the
     // browsed path sticky via remembered initialPath below.
+    // Single-channel SFTP does not borrow that terminal, so A -> B -> A must
+    // keep the login that is already up for this endpoint.
+    const backendSessionUp = activeConnectionId ? hasBackendSession(activeConnectionId) : false;
+    const endpointAlreadyConnected = shouldSkipSftpSidePanelAutoConnect(
+      connectionKey,
+      connectedKeyRef.current,
+      activeTab,
+      backendSessionUp,
+      activeTabConnectionKey,
+    );
+    const splitEndpointStillUp = isSplitFocusSftpStillConnected(
+      connectionKey,
+      connectedKeyRef.current,
+      activeTab,
+      backendSessionUp,
+      activeTabConnectionKey,
+    );
+    const keepSplitSftp = shouldKeepConnectedSftpOnSplitFocus({
+      sessionChanged,
+      previousSessionId: lastSourceSessionIdRef.current,
+      nextSessionId: activeSessionId,
+      endpointAlreadyConnected: splitEndpointStillUp,
+    });
     if (
-      !sessionChanged
-      && !pendingRequiresForcedRebind
-      && shouldSkipSftpSidePanelAutoConnect(
-        connectionKey,
-        connectedKeyRef.current,
-        activeTab,
-        activeConnectionId ? hasBackendSession(activeConnectionId) : false,
-        activeTabConnectionKey,
-      )
+      !pendingRequiresForcedRebind
+      && (endpointAlreadyConnected || splitEndpointStillUp)
+      && (!sessionChanged || keepSplitSftp)
     ) {
       if (activeSessionId) {
         lastSourceSessionIdRef.current = activeSessionId;
@@ -837,13 +935,20 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
 
     connectedKeyRef.current = connectionKey;
     connectedHostObjRef.current = activeHost;
+    const dedicatedSftpLogin = sftpBannerDecision?.sessionId === activeSessionId
+      && sftpBannerDecision.singleChannel;
+    const reuseTerminalTransport = !dedicatedSftpLogin && (
+      Boolean(pendingStrictSourceSessionId) || activeSessionStatus === "connected"
+    );
     const connect = (
       connectRequestKey?: string,
       onConnectionCreated?: (target: { tabId: string; connectionId: string }) => void,
     ) => s.connect("left", activeHost, {
-      sourceSessionId: pendingStrictSourceSessionId
-        ?? (activeSessionStatus === "connected" ? (activeSessionId ?? undefined) : undefined),
-      requireSourceSessionReuse: Boolean(pendingStrictSourceSessionId),
+      sourceSessionId: reuseTerminalTransport
+        ? (pendingStrictSourceSessionId ?? (activeSessionId ?? undefined))
+        : undefined,
+      requireSourceSessionReuse: reuseTerminalTransport && Boolean(pendingStrictSourceSessionId),
+      ...(reuseTerminalTransport ? {} : { reuseTransport: false }),
       ...(connectRequestKey ? { connectRequestKey } : undefined),
       onConnectionCreated,
       ...(initialPath ? { initialPath } : undefined),
@@ -875,6 +980,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     pendingUploadRebindSettledRequestId,
     pendingUploadRebindStartedIdRef,
     sessions,
+    sftpBannerDecision,
     startPendingUploadRebind,
   ]);
 
@@ -1276,6 +1382,10 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
         sftpDefaultViewMode={sftpDefaultViewMode}
         activeHost={activeHost}
         activeSessionId={activeSessionId}
+        bannerRequiresSingleChannel={
+          sftpBannerDecision?.sessionId === activeSessionId
+          && sftpBannerDecision.singleChannel
+        }
         focusedSessionId={focusedSessionId}
         showWorkspaceHostHeader={showWorkspaceHostHeader}
         renderOverlays={renderOverlays}
@@ -1305,6 +1415,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
         selectDirectory={selectDirectory}
         listLocalDir={listLocalDir}
         listDrives={listDrives}
+        statSftp={statSftp}
         openPath={openPath}
         t={t}
       />
@@ -1323,6 +1434,7 @@ type SftpSidePanelInteractiveBodyProps = {
   sftpDefaultViewMode: "list" | "tree";
   activeHost: Host | null;
   activeSessionId?: string | null;
+  bannerRequiresSingleChannel?: boolean;
   focusedSessionId?: string | null;
   showWorkspaceHostHeader: boolean;
   renderOverlays: boolean;
@@ -1357,6 +1469,7 @@ type SftpSidePanelInteractiveBodyProps = {
   selectDirectory: ReturnType<typeof useSftpBackend>["selectDirectory"];
   listLocalDir: ReturnType<typeof useSftpBackend>["listLocalDir"];
   listDrives: ReturnType<typeof useSftpBackend>["listDrives"];
+  statSftp: ReturnType<typeof useSftpBackend>["statSftp"];
   openPath: ReturnType<typeof useSftpBackend>["openPath"];
   t: ReturnType<typeof useI18n>["t"];
 };
@@ -1372,6 +1485,7 @@ const SftpSidePanelInteractiveBody: React.FC<SftpSidePanelInteractiveBodyProps> 
   sftpDefaultViewMode,
   activeHost,
   activeSessionId = null,
+  bannerRequiresSingleChannel = false,
   focusedSessionId = null,
   showWorkspaceHostHeader,
   renderOverlays,
@@ -1399,6 +1513,7 @@ const SftpSidePanelInteractiveBody: React.FC<SftpSidePanelInteractiveBodyProps> 
   selectDirectory,
   listLocalDir,
   listDrives,
+  statSftp,
   openPath,
   t,
 }) => {
@@ -1493,6 +1608,7 @@ const SftpSidePanelInteractiveBody: React.FC<SftpSidePanelInteractiveBodyProps> 
     setFileOpenerTarget,
     handleSaveTextFile,
     onPromoteToTab,
+    onPopOut,
     handleFileOpenerSelect,
     handleSelectSystemApp,
   } = useSftpViewPaneCallbacks({
@@ -1508,6 +1624,7 @@ const SftpSidePanelInteractiveBody: React.FC<SftpSidePanelInteractiveBodyProps> 
     showSaveDialog,
     selectDirectory,
     getSftpIdForConnection: sftp.getSftpIdForConnection,
+    statSftp,
     listLocalFiles: listLocalDir,
     listDrives,
   });
@@ -1577,11 +1694,12 @@ const SftpSidePanelInteractiveBody: React.FC<SftpSidePanelInteractiveBodyProps> 
 
   const canFollowTerminalCwd = useMemo(() => {
     if (!onGetTerminalCwd || !followTerminalCwdHost) return false;
+    if (bannerRequiresSingleChannel) return false;
     const proto = followTerminalCwdHost.protocol;
     if (proto === "local" || proto === "serial") return false;
     if (followTerminalCwdHost.id?.startsWith("local-") || followTerminalCwdHost.id?.startsWith("serial-")) return false;
     return true;
-  }, [followTerminalCwdHost, onGetTerminalCwd]);
+  }, [bannerRequiresSingleChannel, followTerminalCwdHost, onGetTerminalCwd]);
 
   const hasActiveWork = showTextEditor || !!permissionsState || showFileOpenerDialog
     || (sftp.activeFileWatchCountRef?.current ?? 0) > 0
@@ -1942,6 +2060,7 @@ const SftpSidePanelInteractiveBody: React.FC<SftpSidePanelInteractiveBodyProps> 
           handleFileOpenerSelect={handleFileOpenerSelect}
           handleSelectSystemApp={handleSelectSystemApp}
           onPromoteToTab={onPromoteToTab}
+          onPopOut={onPopOut}
           onRequestTerminalFocus={onRequestTerminalFocus}
           t={t}
         />

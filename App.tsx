@@ -1,3 +1,5 @@
+import { MonitorHostKeyDialog } from './components/vault/MonitorHostKeyDialog';
+import { MonitorRuntimeHost } from './application/app/MonitorRuntimeHost';
 import React, { useEffect } from 'react';
 
 import { initializeFonts } from './application/state/fontStore';
@@ -11,6 +13,7 @@ import { TooltipProvider } from './components/ui/tooltip';
 import { ScriptAutomationRoot } from './components/scripts/ScriptAutomationRoot';
 import { ExternalMcpApprovalsHost } from './components/ai/ExternalMcpApprovalsHost';
 import { PluginAuthenticationHost } from './components/plugins/PluginAuthenticationHost';
+import { MultilinePasteConfirmHost } from './components/terminal/MultilinePasteConfirmDialog';
 import { useExternalMcpGrantPersister } from './components/ai/useExternalMcpGrantPersister';
 import { setupMcpApprovalBridge } from './infrastructure/ai/shared/approvalGate';
 import { setupCodexAppServerInteractionBridge } from './infrastructure/ai/shared/codexAppServerInteractions';
@@ -46,7 +49,9 @@ function SettingsI18nProvider({ children }: { children: React.ReactNode }) {
 function App() {
   return (
     <AppLocalStateProvider>
+      <MonitorRuntimeHost />
       <AppSideEffects />
+      <MonitorHostKeyDialog />
       <AppShell />
     </AppLocalStateProvider>
   );
@@ -81,6 +86,7 @@ function AppWithProviders({ settings, appLock }: { settings: SettingsState; appL
               <ScriptAutomationRoot />
               <ExternalMcpApprovalsHost />
               <PluginAuthenticationHost />
+              <MultilinePasteConfirmHost />
               <VaultPublisher>
                 <SessionPublisher persistSessionRestore={!isPeerSessionWindow}>
                   <App />

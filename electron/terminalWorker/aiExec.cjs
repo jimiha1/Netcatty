@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { clearSessionFlowState } = require("../bridges/terminalFlowAck.cjs");
 const {
   execViaPty,
   startPtyJob,
@@ -10,7 +11,7 @@ const {
 const { getFreshIdlePrompt, formatSyntheticEcho } = require("../bridges/ai/shellUtils.cjs");
 const {
   ensureSessionShellKind,
-  ensureSessionShellKindForExec,
+  remoteDisallowsExecChannelProbe, sessionDisallowsExtraSshChannel, ensureSessionShellKindForExec,
 } = require("../bridges/ai/sessionShellKind.cjs");
 const {
   checkBlocklistForShell,
@@ -285,16 +286,25 @@ function createWorkerAiExecHandler({
         return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
       }
       return execViaPty(ptyStream, command, {
+        onInterrupt: () => clearSessionFlowState(session),
         stripMarkers: true,
         trackForCancellation: activePtyExecs,
         timeoutMs,
         shellKind: session.shellKind,
         loginShellHint: session._loginShellKind,
         probeLiveShell: true,
+        bastionKeystrokes: remoteDisallowsExecChannelProbe(session.remoteSshVersion),
+        skipPendingInputClear: session.singleChannelSsh === true,
         onProbeAborted: (marker) => {
           event?.sender?.send?.("netcatty:data", {
             sessionId,
             data: `${marker}_R\n`,
+          });
+        },
+        onEchoSuppressionPrime: (marker) => {
+          event?.sender?.send?.("netcatty:data", {
+            sessionId,
+            data: `${marker}_I\n`,
           });
         },
         chatSessionId,
@@ -316,7 +326,7 @@ function createWorkerAiExecHandler({
     }
 
     const sshClient = session.sshClient || session.conn;
-    if (sshClient && typeof sshClient.exec === "function") {
+    if (!session.singleChannelSsh && sshClient && typeof sshClient.exec === "function") {
       const probed = await ensureSessionShellKindForExec(session, {
         trackForCancellation: activePtyExecs,
         chatSessionId,
@@ -490,14 +500,26 @@ function createWorkerAiJobStartHandler({
     let handle;
     try {
       handle = startPtyJob(ptyStream, command, {
+        onInterrupt: () => clearSessionFlowState(session),
         timeoutMs,
+        sessionId,
+        jobId,
+        diagnosticsSession: session,
         shellKind: session.shellKind,
         loginShellHint: session._loginShellKind,
         probeLiveShell: true,
+        bastionKeystrokes: remoteDisallowsExecChannelProbe(session.remoteSshVersion),
+        skipPendingInputClear: session.singleChannelSsh === true,
         onProbeAborted: (marker) => {
           event?.sender?.send?.("netcatty:data", {
             sessionId,
             data: `${marker}_R\n`,
+          });
+        },
+        onEchoSuppressionPrime: (marker) => {
+          event?.sender?.send?.("netcatty:data", {
+            sessionId,
+            data: `${marker}_I\n`,
           });
         },
         chatSessionId,

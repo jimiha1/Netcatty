@@ -66,6 +66,8 @@ import {
   getSessionConnectionLabel,
 } from '../../domain/sessionTabTitle';
 import { cleanupClosedTerminalSessions } from './aiStateSnapshots';
+import { syncSessionHostLabels } from '../../domain/syncSessionHostLabels';
+import { useVaultSnapshotField } from './vaultSnapshotStore';
 
 export function addWorkspaceIfMissing(
   workspaces: Workspace[],
@@ -266,6 +268,20 @@ export const useSessionState = ({
       activeTabStore.setActiveTabId(initialRestoreState.activeTabId);
     }
   }, [initialRestoreState.activeTabId]);
+
+  // Keep open sessions' connection label in sync with the vault. Sessions
+  // snapshot `hostLabel` at connect time, so renaming a host would otherwise
+  // leave its already-open tabs (and merged-workspace titles derived from
+  // those labels) showing the old name until the session is closed. The
+  // generated-title sync effect below re-runs on this session change and
+  // refreshes synthesized workspace titles too.
+  const vaultHosts = useVaultSnapshotField('hosts');
+  useEffect(() => {
+    if (vaultHosts.length === 0) return;
+    // The helper returns the same array reference when nothing changed, so
+    // React bails out of the state update.
+    setSessions(prev => syncSessionHostLabels(prev, vaultHosts));
+  }, [vaultHosts]);
 
   // Keep generated merged-workspace titles (e.g. "01/02" after dragging tab
   // "02" onto "01") synchronized with the workspace's current membership and
@@ -1082,17 +1098,12 @@ export const useSessionState = ({
     if (targetHosts.length === 0) return;
     const resolvedCommand = commandOverride ?? snippet.command;
 
-    // Create sessions for each target host
-    const newSessions: TerminalSession[] = targetHosts.map(host => ({
-      id: crypto.randomUUID(),
-      hostId: host.id,
-      hostLabel: host.label,
-      hostname: host.hostname,
-      username: host.username,
-      status: 'connecting' as const,
-      charset: host.charset,
-      // workspaceId will be set after workspace is created
-    }));
+    // Create sessions for each target host. createHostTerminalSession copies
+    // protocol, shellType, and local-shell metadata, so local vault hosts keep
+    // their transport info (session consumers treat a missing protocol as SSH).
+    const newSessions: TerminalSession[] = targetHosts.map(host =>
+      createHostTerminalSession(crypto.randomUUID(), host),
+    );
 
     const sessionIds = newSessions.map(s => s.id);
     

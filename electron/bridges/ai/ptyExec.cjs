@@ -27,8 +27,10 @@ const {
   stripAnsi,
 } = require("./ptyExecHelpers.cjs");
 const { extractTrailingIdlePrompt } = require("./shellUtils.cjs");
+const { getSessionSnapshot } = require("../terminalInterruptDiagnostics.cjs");
+const { createJobStartupDiag } = require("./jobStartupDiagnostics.cjs");
 
-const { buildLiveShellProbe, parseLiveShellProbe } = require("./liveShellProbe.cjs");
+const { buildLiveShellProbe, buildLiveShellProbeCleanup, parseLiveShellProbe } = require("./liveShellProbe.cjs");
 
 const DEFAULT_FOREGROUND_PTY_CAPTURE_CHARS = 1024 * 1024;
 const END_MARKER_PROMPT_WAIT_MS = 30000;
@@ -57,12 +59,19 @@ function startPtyJob(ptyStream, command, options) {
     shellKind,
     loginShellHint,
     probeLiveShell = false,
+    bastionKeystrokes = false,
+    skipPendingInputClear = false,
     onProbeAborted,
+    onInterrupt,
     chatSessionId,
     abortSignal,
     expectedPrompt,
+    jobId = null,
+    sessionId = null,
+    diagnosticsSession = null,
     typedInput = false,
     echoCommand,
+    onEchoSuppressionPrime,
     maxBufferedChars = 0,
     normalizeFinalOutput = true,
     enforceWallTimeout = false,
@@ -165,7 +174,7 @@ function startPtyJob(ptyStream, command, options) {
   function armOutputTimeout() {
     clearTimeout(timeoutId);
     timeoutId = setTimeout(() => {
-      sendInterrupt();
+      sendInterrupt("inactivity-timeout");
       if (cancelRequested) {
         armOutputTimeout();
         return;
@@ -188,7 +197,7 @@ function startPtyJob(ptyStream, command, options) {
         finishWithoutReturnedPrompt();
         return;
       }
-      sendInterrupt();
+      sendInterrupt("wall-timeout");
       const timeoutSec = Math.round(timeoutMs / 1000);
       finish(foundStart ? output : preStartOutput, -1, `Command timed out (${timeoutSec}s)`);
     }, timeoutMs);
@@ -209,7 +218,17 @@ function startPtyJob(ptyStream, command, options) {
     const startupMs = maxBufferedChars > 0 ? BG_STARTUP_TIMEOUT_MS : timeoutMs;
     startupTimeoutId = setTimeout(() => {
       if (finished || foundStart) return;
-      sendInterrupt();
+      jobDiag.emit("startup-timeout-fired", {
+        elapsedMs: startupMs,
+        foundStart,
+        probeOutputSeen: jobDiag.stats.probeOutputSeen,
+        probeBytes: jobDiag.stats.probeBytes,
+        outputChunks: jobDiag.stats.outputChunks,
+        outputChars: jobDiag.stats.outputChars,
+        preStartChars: preStartOutput.length,
+        session: diagSnapshot(),
+      });
+      sendInterrupt("startup-timeout");
       const label = maxBufferedChars > 0 ? "Background job startup" : "Command startup";
       finish(preStartOutput, -1, `${label} timed out — start marker never arrived`);
     }, startupMs);
@@ -221,21 +240,62 @@ function startPtyJob(ptyStream, command, options) {
     }
   }
 
-  function sendInterrupt() {
-    try {
-      if (typeof ptyStream.signal === "function") {
-        ptyStream.signal("INT");
-      }
-    } catch {
-      // Ignore signal failures and fall back to ETX.
-    }
+  // Read-only #3443 diagnostics. Created after the SHELL_PROMPT_PENDING
+  // rejection above so "accepted" means the job actually started. The stats
+  // object is updated by onData so the timeout event can report what the
+  // pipeline had seen when the start marker never arrived.
+  const jobDiag = createJobStartupDiag({ sessionId, jobId, chatSessionId });
+  const diagSnapshot = () => getSessionSnapshot(diagnosticsSession || (ptyStream ? { stream: ptyStream } : null));
+  jobDiag.emit("job-start-accepted", {
+    outputMode: maxBufferedChars > 0 ? "background" : "foreground",
+    shellKind: resolvedShellKind,
+    probeLiveShell: usesLiveShellProbe,
+    timeoutMs,
+    startupTimeoutMs: maxBufferedChars > 0 ? BG_STARTUP_TIMEOUT_MS : timeoutMs,
+  });
+
+  // Deliver the interrupt as terminal data (ETX). This matches manual Ctrl+C
+  // in the terminal and terminalBridge.interruptSession: the remote line
+  // discipline turns \x03 into SIGINT. Never send an SSH "signal" channel
+  // request here — real OpenSSH rejects it ("session_signal_req: session
+  // signalling requires privilege separation"), which pollutes auth logs and
+  // makes other host-side tooling report brute-force noise (#3577).
+  function sendInterrupt(trigger = null) {
+    let etxWritten = false;
     try {
       if (typeof ptyStream.write === "function") {
         ptyStream.write("\x03");
+        etxWritten = true;
       }
     } catch {
       // Ignore PTY write failures during cancellation.
     }
+    jobDiag.emit("send-interrupt", {
+      trigger,
+      signalSent: false,
+      etxWritten,
+      session: diagSnapshot(),
+    });
+    // Cancellation replies use the same readable stream as terminal output.
+    // Recover session-owned flow control after sending ETX, otherwise a paused
+    // renderer can hide the returned prompt/end marker and trigger retries.
+    // Recovery belongs to the session and must still run when a timeout
+    // finishes this job before the queued callback executes.
+    queueMicrotask(() => {
+      if (!onInterrupt) {
+        jobDiag.emit("interrupt-callback-skipped", { trigger, reason: "no-callback" });
+        return;
+      }
+      try {
+        onInterrupt();
+        // finishedAtCallback === true means the job was already finished when
+        // recovery ran (e.g. a startup timeout finished it first) - the exact
+        // ordering the #3443 investigation hinged on.
+        jobDiag.emit("interrupt-callback-invoked", { trigger, finishedAtCallback: finished });
+      } catch {
+        jobDiag.emit("interrupt-callback-skipped", { trigger, reason: "callback-threw" });
+      }
+    });
   }
 
   function requestCancel() {
@@ -262,15 +322,15 @@ function startPtyJob(ptyStream, command, options) {
       }, 2000);
       cancelOneShotTimers.push(t);
     }
-    sendInterrupt();
+    sendInterrupt("cancel");
     cancelRetryTimerId = setTimeout(function retryCancel() {
       if (finished || !cancelRequested) return;
-      sendInterrupt();
+      sendInterrupt("cancel-retry");
       cancelRetryTimerId = setTimeout(retryCancel, CANCEL_RETRY_MS);
     }, CANCEL_RETRY_MS);
     armOutputTimeout();
     const t150 = setTimeout(() => {
-      if (!finished) sendInterrupt();
+      if (!finished) sendInterrupt("cancel-followup");
     }, 150);
     cancelOneShotTimers.push(t150);
     // Hard wall-clock deadline for cancellation: if the process ignores
@@ -417,7 +477,7 @@ function startPtyJob(ptyStream, command, options) {
   function finish(stdout, exitCode, error) {
     if (finished) return;
     finished = true;
-    if (usesLiveShellProbe && !foundStart && typeof onProbeAborted === "function") {
+    if (!foundStart && typeof onProbeAborted === "function") {
       try {
         onProbeAborted(marker);
       } catch {
@@ -528,8 +588,24 @@ function startPtyJob(ptyStream, command, options) {
       : data instanceof Uint8Array
         ? Buffer.from(data)
         : Buffer.from(String(data ?? ""));
+    // Count what actually arrived before decoding: a chunk that is only an
+    // incomplete UTF-8 prefix yields no text yet but is still probe evidence.
+    if (bytes.length > 0) jobDiag.stats.outputChunks += 1;
+    if (probingShell && bytes.length > 0) {
+      jobDiag.stats.probeBytes += bytes.length;
+      // Raw output may be an incomplete character, an echo or unrelated data;
+      // only probe-reply-parsed proves that the shell replied to the probe.
+      if (!jobDiag.stats.probeOutputSeen) {
+        jobDiag.stats.probeOutputSeen = true;
+        jobDiag.emit("probe-output-arrived", {
+          probeBytes: jobDiag.stats.probeBytes,
+          session: diagSnapshot(),
+        });
+      }
+    }
     const text = outputDecoder.write(bytes);
     if (!text) return;
+    jobDiag.stats.outputChars += text.length;
     if (!pendingEnd && !deliveringInput) armOutputTimeout();
 
     if (probingShell) {
@@ -540,11 +616,17 @@ function startPtyJob(ptyStream, command, options) {
       }
       const probe = parseLiveShellProbe(stripAnsi(probeOutput), marker);
       if (!probe) return;
+      jobDiag.emit("probe-reply-parsed", {
+        shellKind: probe.kind ?? null,
+        probeBytes: jobDiag.stats.probeBytes,
+      });
       probingShell = false;
       probeOutput = "";
       if (probe.kind) resolvedShellKind = probe.kind;
       if (finished || cancelRequested) return;
-      writeWrappedCommand();
+      const isZsh = /^zsh(?:[-.][0-9].*)?$/i.test(probe.shellName);
+      const skipProbeCleanup = probe.kind === "fish" || isZsh;
+      writeWrappedCommand(skipProbeCleanup ? "" : buildLiveShellProbeCleanup(marker), isZsh);
       return;
     }
 
@@ -567,6 +649,9 @@ function startPtyJob(ptyStream, command, options) {
       pendingStart = trailingPartial;
 
       if (foundStart) {
+        jobDiag.emit("start-marker-matched", {
+          preStartChars: preStartOutput.length,
+        });
         clearStartupTimeout();
         // Use the *last* occurrence of the start marker to skip the echoed
         // wrapper command and capture only output after the real printf line.
@@ -733,13 +818,26 @@ function startPtyJob(ptyStream, command, options) {
   }
 
   let inputWriteTimer = null;
+  let inputDrainListener = null;
   let inputWriteGeneration = 0;
   function stopInputWrite() {
     inputWriteGeneration += 1;
     clearTimeout(inputWriteTimer);
     inputWriteTimer = null;
+    if (inputDrainListener) ptyStream.removeListener("drain", inputDrainListener);
+    inputDrainListener = null;
   }
   cleanupFns.push(stopInputWrite);
+
+  function completeInputDelivery(generation) {
+    // Input delivery is complete: only now does the startup deadline begin,
+    // so paced typing time never consumes the startup budget.
+    if (!finished && !cancelRequested && generation === inputWriteGeneration) {
+      deliveringInput = false;
+      if (!pendingEnd) armOutputTimeout();
+      if (!foundStart) armStartupTimeout();
+    }
+  }
 
   function writeInput(text) {
     stopInputWrite();
@@ -749,44 +847,79 @@ function startPtyJob(ptyStream, command, options) {
     clearTimeout(timeoutId);
     deliveringInput = true;
     const generation = inputWriteGeneration;
+
+    // Keep each write to one Unicode code point for strict bastions, while
+    // retaining bounded pacing so long input cannot overrun shell queues.
     let offset = 0;
-    // Readline may overrun its input queue when long probes arrive in one
-    // write. Yield between bounded chunks; cancelled/replaced jobs must never
-    // finish typing an old command into a subsequent prompt.
-    const chunkSize = usesLiveShellProbe && text.length > 1024 ? 128 : text.length;
+    const batchSize = (usesLiveShellProbe || bastionKeystrokes) && text.length > 1024 ? 128 : text.length;
+    const isCurrent = () => !finished && !cancelRequested && generation === inputWriteGeneration;
+    const scheduleNext = () => {
+      if (!isCurrent()) return;
+      inputWriteTimer = setTimeout(writeNext, 30);
+    };
     const writeNext = () => {
-      if (finished || cancelRequested || generation !== inputWriteGeneration) return;
-      let end = Math.min(offset + chunkSize, text.length);
-      // Do not split a UTF-16 surrogate pair across independently encoded writes.
-      if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
-      ptyStream.write(text.slice(offset, end));
-      offset = end;
-      if (offset < text.length && generation === inputWriteGeneration && !finished && !cancelRequested) {
-        inputWriteTimer = setTimeout(() => {
-          try { writeNext(); } catch (error) {
-            finish(preStartOutput, -1, `Terminal input failed: ${error.message}`);
+      try {
+        let end = Math.min(offset + batchSize, text.length);
+        if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
+        while (offset < end) {
+          if (!isCurrent()) return;
+          const chunk = bastionKeystrokes
+            ? String.fromCodePoint(text.codePointAt(offset))
+            : text.slice(offset, end);
+          offset += chunk.length;
+          const writable = ptyStream.write(chunk);
+          if (!isCurrent()) return;
+          if (writable === false) {
+            inputDrainListener = () => {
+              inputDrainListener = null;
+              clearTimeout(inputWriteTimer);
+              scheduleNext();
+            };
+            ptyStream.once("drain", inputDrainListener);
+            inputWriteTimer = setTimeout(() => {
+              finish(preStartOutput, -1, "Terminal input timed out waiting for drain");
+            }, maxBufferedChars > 0 ? BG_STARTUP_TIMEOUT_MS : timeoutMs);
+            return;
           }
-        }, 30);
-      } else {
-        // Input delivery is complete: only now does the startup deadline
-        // begin, so paced typing time never consumes the startup budget.
-        if (!finished && !cancelRequested && generation === inputWriteGeneration) {
-          deliveringInput = false;
-          armOutputTimeout();
-          if (!foundStart) armStartupTimeout();
         }
+        if (offset < text.length) scheduleNext();
+        else completeInputDelivery(generation);
+      } catch (error) {
+        finish(preStartOutput, -1, `Terminal input failed: ${error.message}`);
       }
     };
     writeNext();
   }
 
-  function writeWrappedCommand() {
-    const wrapped = buildWrappedCommand(command, resolvedShellKind, marker, probeLiveShell);
-    writeInput(`${buildPendingInputClearPrefix(resolvedShellKind)}${wrapped}`);
+  function writeWrappedCommand(probeCleanup = "", isZsh = false) {
+    // The Bash-only cleanup is a no-op in zsh, but its long input still goes
+    // through the configured editor. Keep the existing bounded wrapper and
+    // omit only that unused fragment after a live zsh reply.
+    const wrapped = buildWrappedCommand(command, resolvedShellKind, marker, probeLiveShell, {
+      omitBashHistoryCleanup: isZsh,
+    });
+    jobDiag.emit("cmd-write", { bytes: Buffer.byteLength(wrapped, "utf8"), shellKind: resolvedShellKind });
+    writeInput(`${(skipPendingInputClear ? "" : buildPendingInputClearPrefix(resolvedShellKind))}${probeCleanup}${wrapped}`);
   }
 
+  // Prime the renderer's display suppression before the first byte is typed
+  // (issue #3384). Shells whose line editor echoes input, such as BusyBox ash
+  // on OpenWrt, break long echoed lines at the terminal width with CR/LF; the
+  // wrapped fragments no longer contain the marker and would leak through the
+  // per-line echo filter as visible "variables" until the wrapper's own
+  // _I printf runs. Delivering the _I line over the data channel up front
+  // suppresses the whole echo; the _S output releases it, and finish() sends
+  // the _R reset (onProbeAborted) when the command never starts.
+  if (typeof onEchoSuppressionPrime === "function") {
+    try {
+      onEchoSuppressionPrime(marker);
+    } catch {
+      // Display suppression must never prevent the command from starting.
+    }
+  }
   if (probingShell) {
-    writeInput(`${buildPendingInputClearPrefix(resolvedShellKind)}${buildLiveShellProbe(marker)}`);
+    jobDiag.emit("probe-write", { bytes: Buffer.byteLength(buildLiveShellProbe(marker), "utf8") });
+    writeInput(`${(skipPendingInputClear ? "" : buildPendingInputClearPrefix(resolvedShellKind))}${buildLiveShellProbe(marker)}`);
   } else {
     writeWrappedCommand();
   }
@@ -825,6 +958,9 @@ function startPtyJob(ptyStream, command, options) {
  * @param {string} [options.expectedPrompt] - Last observed idle prompt for exact fallback matching
  * @param {boolean} [options.typedInput=false] - Emit synthetic command echo before execution
  * @param {(command: string) => void} [options.echoCommand] - Callback used to display synthetic command echo
+ * @param {string} [options.jobId] - Background job ID for #3443 startup diagnostics keying
+ * @param {string} [options.sessionId] - Terminal session ID for #3443 startup diagnostics keying
+ * @param {object} [options.diagnosticsSession] - Session object for flow-control snapshots in #3443 diagnostics
  */
 function execViaPty(ptyStream, command, options) {
   return startPtyJob(ptyStream, command, options).resultPromise;

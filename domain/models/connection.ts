@@ -127,6 +127,12 @@ export interface SerialConfig {
   lineMode?: boolean; // Line mode - buffer input and send on Enter (default: false)
   // Store the default explicitly so an open/restored session keeps its launch-time behavior.
   backspaceBehavior?: 'default' | 'ctrl-h';
+  // Byte-oriented backspace: when explicitly enabled, a Backspace deletes the
+  // whole multi-byte character by sending one DEL per wire byte (correct for
+  // MCUs/routers that remove bytes).  Set to false for character-aware line
+  // editors (e.g. a Linux console with readline) where one DEL already
+  // removes a whole character and repeating it would over-delete.
+  byteOrientedBackspace?: boolean;
 }
 
 // Per-protocol configuration
@@ -307,7 +313,8 @@ export interface Host {
   order?: number;
 }
 
-export type KeyType = 'RSA' | 'ECDSA' | 'ED25519';
+/** Software keys plus OpenSSH FIDO2 security-key types (agent + hardware only). */
+export type KeyType = 'RSA' | 'ECDSA' | 'ED25519' | 'ED25519-SK' | 'ECDSA-SK';
 type KeySource = 'generated' | 'imported' | 'reference';
 export type KeyCategory = 'key' | 'certificate' | 'identity';
 type IdentityAuthMethod = 'password' | 'key' | 'certificate';
@@ -406,6 +413,8 @@ export interface GroupNode {
 /** Default configuration for a group. Hosts in this group inherit these values when not explicitly set. */
 export interface GroupConfig {
   path: string;
+  /** Markdown notes for this group only; not inherited by hosts or subgroups. */
+  notes?: string;
   order?: number;
   username?: string;
   password?: string;

@@ -5,6 +5,35 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { ComposerModelPicker } from './ComposerModelPicker';
+import { I18nProvider } from '../../application/i18n/I18nProvider';
+
+for (const [locale, cachedLabel] of [
+  ['en', 'Cached'],
+  ['zh-CN', '缓存'],
+  ['zh-TW', '快取'],
+  ['es', 'En caché'],
+  ['ru', 'Кэш'],
+]) {
+  test(`cached catalog without a usable timestamp has a clean label in ${locale}`, () => {
+    for (const fetchedAt of [undefined, 'invalid-date']) {
+      const html = renderToStaticMarkup(
+        <I18nProvider locale={locale}>
+          <ComposerModelPicker
+            modelPresets={[{ id: 'saved-model', name: 'Saved model' }]}
+            selectedModelId="saved-model"
+            catalogSource="last-known-good"
+            catalogFetchedAt={fetchedAt}
+            prefs={{ recent: [], pinned: [] }}
+            onSelectModel={() => {}}
+            onTogglePinned={() => {}}
+          />
+        </I18nProvider>,
+      );
+      assert.ok(html.includes(`title="${cachedLabel}"`));
+      assert.doesNotMatch(html, /\{time\}|ai\.chat\.modelCatalog/);
+    }
+  });
+}
 
 test('Catty picker keeps a single model list and hides other providers until the submenu opens', () => {
   const html = renderToStaticMarkup(
@@ -61,8 +90,69 @@ test('external agent picker lists presets without a provider column', () => {
   assert.doesNotMatch(html, /ai\.chat\.providers/);
 });
 
-test('custom model action is only offered in Catty provider-switcher mode', () => {
+test('custom model action is offered in provider-switcher and preset modes', () => {
   const source = readFileSync(new URL('./ComposerModelPicker.tsx', import.meta.url), 'utf8');
-  assert.match(source, /const showCustom = Boolean\(\s*hasProviders/s);
+  // Custom ids are accepted regardless of mode (provider catalog or CLI
+  // presets) — #3534 wants manual model entry for external agents too.
+  assert.match(source, /const showCustom = Boolean\(\s*allowCustomEntry\s*&&\s*trimmedQuery/s);
   assert.match(source, /resolveComposerEnterModelId/);
+});
+
+test('custom model action can be suppressed when the host locks the model', () => {
+  const source = readFileSync(new URL('./ComposerModelPicker.tsx', import.meta.url), 'utf8');
+  // Codex config-locked models override every selection on send; the host
+  // turns the action off so it never becomes a silent no-op.
+  assert.match(source, /allowCustomEntry = true/);
+  const html = renderToStaticMarkup(
+    <ComposerModelPicker
+      modelPresets={[{ id: 'gpt-5.5', name: 'GPT-5.5' }]}
+      selectedModelId="gpt-5.5"
+      prefs={{ recent: [], pinned: [] }}
+      allowCustomEntry={false}
+      onSelectModel={() => {}}
+      onTogglePinned={() => {}}
+    />,
+  );
+  assert.doesNotMatch(html, /ai\.chat\.useCustomModel/);
+});
+
+test('reselecting a saved custom model preserves its custom provenance', () => {
+  const source = readFileSync(new URL('./ComposerModelPicker.tsx', import.meta.url), 'utf8');
+  // A saved custom id is appended to the preset list, so picking it from
+  // Recent has showCustom === false. The callback must keep the custom flag
+  // anyway, or the host overwrites the pref entry without it and
+  // resolveComposerCustomModelIds drops the model from the presets.
+  assert.match(source, /customPrefIds\.has\(modelId\.toLowerCase\(\)\)/);
+});
+
+test('external agent picker keeps preset rows truncation-friendly with a full-name tooltip', () => {
+  const html = renderToStaticMarkup(
+    <ComposerModelPicker
+      modelPresets={[{ id: 'gpt-5.6-sol-very-long-preview-id', name: 'GPT-5.6 Sol (preview)' }]}
+      selectedModelId="gpt-5.6-sol-very-long-preview-id"
+      prefs={{ recent: [], pinned: [] }}
+      onSelectModel={() => {}}
+      onTogglePinned={() => {}}
+    />,
+  );
+
+  assert.match(html, /title="GPT-5\.6 Sol \(preview\)"/);
+});
+
+test('external agent picker shows the loading row while the live catalog is pending', () => {
+  const html = renderToStaticMarkup(
+    <ComposerModelPicker
+      modelPresets={[]}
+      loading
+      selectedModelId={undefined}
+      prefs={{ recent: [], pinned: [] }}
+      onSelectModel={() => {}}
+      onTogglePinned={() => {}}
+    />,
+  );
+
+  assert.match(html, /ai\.chat\.loadingModels/);
+  // With no presets the picker renders only the loading row; the host now
+  // keeps built-in presets visible during loading and passes them through.
+  assert.doesNotMatch(html, /gpt-5\.1/);
 });

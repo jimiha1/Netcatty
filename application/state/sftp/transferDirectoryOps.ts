@@ -1,5 +1,5 @@
 import { reconcileSupersededControls } from "./globalSftpTransferControl";
-import { runTransferAndWaitForOwner } from "./waitForTransferOwner";
+import { runTransferAndWaitForOwner, TransferOwnerChangedError } from "./waitForTransferOwner";
 import { useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import type { Host, SftpFileEntry, SftpFilenameEncoding, TransferStatus, TransferTask } from "../../../domain/models";
 import {
@@ -118,6 +118,10 @@ async function tryStatTransferPath(
     if (!sftpId) return null;
     const stat = await netcattyBridge.get()?.statSftp?.(sftpId, filePath, encoding);
     if (!stat || stat.type === "directory") return null;
+    // Stat-less SCP endpoints report size as a placeholder 0 (sizeKnown false).
+    // Treat that as missing metadata so skip-unchanged is disabled rather than
+    // comparing a fake zero against the other endpoint (Codex P1).
+    if (stat.sizeKnown === false) return null;
     return { size: Number(stat.size) || 0, lastModified: Number(stat.lastModified) || 0, type: stat.type };
   } catch {
     return null;
@@ -558,11 +562,20 @@ export function useSftpDirectoryTransferOps({
     }
     const listingGate = progress.listingGate;
     const traversal = traversalBudget ?? createSftpDirectoryTraversalBudget();
+    // Only the newly supported same-pane local copy needs this fallback.
+    // Preserve existing large local uploads and cross-pane copies.
+    const boundLocalTraversal = sourceIsLocal && targetIsLocal
+      && task.sourceConnectionId === task.targetConnectionId;
     let claimedCanonicalPath: string | null = null;
     let regularFiles: SftpFileEntry[] = [];
     // Keep the current remote ancestor active through child discovery.
     try {
-      if (!sourceIsLocal && sourceSftpId) {
+      // Bound same-pane local copies that rediscover their own output through
+      // filesystem aliases not detected by the paste guard.
+      if (boundLocalTraversal) {
+        claimedCanonicalPath = claimSftpDirectoryVisit(traversal, task.sourcePath);
+        if (!claimedCanonicalPath) return totalErrors;
+      } else if (!sourceIsLocal && sourceSftpId) {
         const bridge = netcattyBridge.get();
         const canonicalPath = await bridge?.realpathSftp?.(sourceSftpId, task.sourcePath, sourceEncoding)
           .catch(() => task.sourcePath) ?? task.sourcePath;
@@ -611,7 +624,7 @@ export function useSftpDirectoryTransferOps({
 
       // Filter both "." and ".." — some SFTP servers include "." in readdir
       const filtered = files.filter((f) => f.name !== ".." && f.name !== ".");
-      if (!sourceIsLocal) accountSftpDirectoryEntries(traversal, filtered.length);
+      if (!sourceIsLocal || boundLocalTraversal) accountSftpDirectoryEntries(traversal, filtered.length);
       // Separate directories from files.
       // Symlink directories are only followed when followSymlinks is true
       // (downloadToLocal). Uploads/copies treat symlinks as regular entries
@@ -959,14 +972,15 @@ export function useSftpDirectoryTransferOps({
             if (isTransferCancelledError(err)) {
               // Keep cancelled status; do not rethrow — other workers must finish
               // and the parent should not become a clean completed tree.
-              setTransfers((prev) =>
-                prev.map((t) =>
-                  t.id === fileId
-                    ? { ...t, status: "cancelled" as TransferStatus, error: undefined, endTime: Date.now() }
-                    : t,
-                ),
-              );
+              setTransfers((prev) => prev.map((task) =>
+                task.id === fileId
+                  ? { ...task, status: "cancelled" as TransferStatus, error: undefined, endTime: Date.now() }
+                  : task));
               errors.push(err instanceof Error ? err : new Error(message));
+              return;
+            }
+            if (err instanceof TransferOwnerChangedError) {
+              errors.push(err);
               return;
             }
             // Mark child as failed

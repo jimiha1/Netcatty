@@ -2,7 +2,9 @@
 
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
+const { Duplex } = require("node:stream");
 const test = require("node:test");
+const { setRendererFlowPaused, clearSessionFlowState } = require("../bridges/terminalFlowAck.cjs");
 
 const {
   createWorkerAiJobStartHandler,
@@ -18,8 +20,10 @@ class FakePty extends EventEmitter {
 
   write(data) {
     this.writes.push(String(data));
-    if (String(data).includes("command sh -c")) {
-      const marker = String(data).match(/(__NCMCP_[A-Za-z0-9_]+__)/)[1];
+    const input = this.writes.join("");
+    if (!this.probeReplied && input.includes("command sh -c") && input.endsWith("_Q'\n")) {
+      this.probeReplied = true;
+      const marker = input.match(/(__NCMCP_[A-Za-z0-9_]+__)/)[1];
       queueMicrotask(() => this.emit("data", `${marker}_P:\n${marker}_Q`));
     }
   }
@@ -52,9 +56,19 @@ function createFakeEvent() {
   };
 }
 
-function extractMarker(writes) {
-  const wrapper = writes.find((entry) => entry.includes("__NCMCP_") && !entry.includes("command sh -c"));
-  assert.ok(wrapper, "expected wrapped command to be written to the PTY");
+async function waitForWrapper(writes) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const input = writes.join("");
+    const wrapper = input.slice(input.lastIndexOf("\x0b\x15"));
+    if (wrapper.includes("_cmd") && wrapper.includes("_E:") && wrapper.endsWith("\n") && !wrapper.endsWith("\\\n")) return wrapper;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.fail("expected complete wrapped command to be written to the PTY");
+}
+
+async function extractMarker(writes) {
+  const wrapper = await waitForWrapper(writes);
   const match = wrapper.match(/(__NCMCP_[A-Za-z0-9_]+__)/);
   assert.ok(match, "expected command wrapper to contain an MCP marker");
   return match[1];
@@ -63,6 +77,58 @@ function extractMarker(writes) {
 function nextTick() {
   return new Promise((resolve) => setImmediate(resolve));
 }
+
+test("worker job stop receives cancellation output while renderer flow is paused", async () => {
+  class PausablePty extends Duplex {
+    constructor() { super(); this.writes = []; }
+    _read() {}
+    _write(chunk, _encoding, done) {
+      const text = chunk.toString();
+      this.writes.push(text);
+      if (text === "\x03") {
+        this.push(`${this.marker}_E:130\r\nroot@test:~# `);
+      } else {
+        const input = this.writes.join("");
+        if (!this.probeReplied && input.includes("command sh -c") && input.endsWith("_Q'\n")) {
+          this.probeReplied = true;
+          this.marker = input.match(/(__NCMCP_[A-Za-z0-9_]+__)/)[1];
+          this.push(`${this.marker}_P:\n${this.marker}_Q`);
+        }
+      }
+      done();
+    }
+  }
+  const pty = new PausablePty();
+  const session = { protocol: "ssh", stream: pty, shellKind: "posix" };
+  const ipcMain = createFakeIpcMain();
+  registerWorkerAiExecHandlers(ipcMain, { sessions: new Map([["ssh-paused", session]]) });
+  const event = createFakeEvent();
+  const started = await ipcMain.handlers.get("netcatty:ai:jobStart")(event, {
+    sessionId: "ssh-paused", command: "sleep 60", chatSessionId: "chat-paused",
+  });
+  const marker = await extractMarker(pty.writes);
+  pty.push(`${marker}_S\r\nstarted\r\n`);
+  await nextTick();
+  setRendererFlowPaused(session, true);
+  assert.equal(pty.isPaused(), true);
+  try {
+    await ipcMain.handlers.get("netcatty:ai:jobStop")(event, {
+      jobId: started.jobId, chatSessionId: "chat-paused",
+    });
+    await nextTick();
+    const polled = await ipcMain.handlers.get("netcatty:ai:jobPoll")(event, {
+      jobId: started.jobId, chatSessionId: "chat-paused",
+    });
+    assert.equal(polled.status, "cancelled");
+    assert.equal(polled.completed, true);
+    assert.equal(polled.error, "Cancelled");
+    assert.equal(pty.writes.filter(data => data === "\x03").length, 1);
+  } finally {
+    clearSessionFlowState(session);
+    await nextTick();
+    pty.destroy();
+  }
+});
 
 function createShellProbeConn(stdout = `${PROBE_OUTPUT_MARKER}/usr/bin/fish\n`) {
   const conn = {
@@ -133,6 +199,7 @@ test("worker AI background jobs start, poll, stop, and block overlapping exec", 
   assert.equal(started.command, "npm test");
   assert.equal(started.status, "running");
   assert.equal(started.outputMode, "foreground-mirrored");
+  const marker = await extractMarker(pty.writes);
   assert.deepEqual(event.rendererMessages, [
     {
       channel: "netcatty:data",
@@ -142,9 +209,14 @@ test("worker AI background jobs start, poll, stop, and block overlapping exec", 
         syntheticEcho: true,
       },
     },
+    {
+      channel: "netcatty:data",
+      payload: {
+        sessionId: "ssh-1",
+        data: `${marker}_I\n`,
+      },
+    },
   ]);
-
-  const marker = extractMarker(pty.writes);
   pty.emit("data", `${marker}_S\r\nready\r\n`);
   await nextTick();
 
@@ -207,7 +279,7 @@ test("worker chat cancellation stops matching background jobs", async () => {
     chatSessionId: "chat-1",
     commandTimeoutMs: 5000,
   });
-  const marker = extractMarker(pty.writes);
+  const marker = await extractMarker(pty.writes);
   pty.emit("data", `${marker}_S\r\nrunning\r\n`);
   await nextTick();
 
@@ -261,11 +333,11 @@ test("worker background job probes unset remote shellKind before wrapping", asyn
   // Login fish is a soft hint (not pinned); wrapper should be fish-native.
   assert.equal(sessions.get("ssh-fish").shellKind, undefined);
   assert.equal(sessions.get("ssh-fish")._loginShellKind, "fish");
-  const wrapper = pty.writes.find((entry) => entry.includes("__NCMCP_") && !entry.includes("command sh -c"));
+  const wrapper = await waitForWrapper(pty.writes);
   assert.match(wrapper, /set -l __NCMCP_.*_cmd/);
   assert.doesNotMatch(wrapper, / sh -c '/);
 
-  const marker = extractMarker(pty.writes);
+  const marker = await extractMarker(pty.writes);
   pty.emit("data", `${marker}_S\r\n${marker}_E:0\r\n`);
   await nextTick();
 });
@@ -305,7 +377,7 @@ test("worker background job reserves the session while shellKind probe is pendin
   const first = await firstStart;
   assert.equal(first.ok, true);
 
-  const marker = extractMarker(pty.writes);
+  const marker = await extractMarker(pty.writes);
   pty.emit("data", `${marker}_S\r\n${marker}_E:0\r\n`);
   await nextTick();
 });
@@ -491,3 +563,32 @@ test("worker exec on an unclassified posix session still blocks command substitu
     "blocked commands must not reach the PTY",
   );
 });
+
+test("single-channel worker exec does not open an exec channel or send line-kill keys", async () => {
+  let execCalls = 0;
+  const pty = new FakePty();
+  const sessions = new Map([["ssh-single", {
+    protocol: "ssh",
+    singleChannelSsh: true,
+    remoteSshVersion: "CLOUDBILITY-4.14",
+    stream: pty,
+    shellKind: "",
+    conn: { exec() { execCalls += 1; throw new Error("exec channel"); } },
+  }]]);
+  const ipcMain = createFakeIpcMain();
+  registerWorkerAiExecHandlers(ipcMain, { sessions });
+  const execution = ipcMain.handlers.get("netcatty:ai:exec")(createFakeEvent(), {
+    sessionId: "ssh-single",
+    command: "uname -a",
+    chatSessionId: "chat-single",
+    commandTimeoutMs: 300,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(execCalls, 0);
+  const input = pty.writes.join("");
+  assert.equal(input.includes("\u0015"), false);
+  assert.equal(input.includes("\u000b"), false);
+  assert.ok(input.length > 0);
+  await execution.catch(() => {});
+});
+

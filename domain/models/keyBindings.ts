@@ -264,7 +264,7 @@ export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
 
   // App Features
   { id: 'open-hosts', action: 'openHosts', label: 'Open Hosts Page', mac: 'Disabled', pc: 'Disabled', category: 'app' },
-  { id: 'open-local', action: 'openLocal', label: 'Open Local Terminal', mac: '⌘ + L', pc: 'Ctrl + L', category: 'app' },
+  { id: 'open-local', action: 'openLocal', label: 'Open Local Terminal', mac: '⌘ + L', pc: 'Disabled', category: 'app' },
   { id: 'open-sftp', action: 'openSftp', label: 'Open SFTP', mac: '⌘ + Shift + O', pc: 'Ctrl + Shift + O', category: 'app' },
   { id: 'port-forwarding', action: 'portForwarding', label: 'Open Port Forwarding', mac: '⌘ + P', pc: 'Ctrl + P', category: 'app' },
   { id: 'command-palette', action: 'commandPalette', label: 'Open Command Palette', mac: '⌘ + K', pc: 'Ctrl + K', category: 'app' },
@@ -276,6 +276,7 @@ export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
   { id: 'side-panel-next-tool', action: 'sidePanelNextTool', label: 'Next Side Panel Tool', mac: '⌘ + ⌥ + ]', pc: 'Ctrl + Alt + ]', category: 'app' },
   { id: 'side-panel-prev-tool', action: 'sidePanelPrevTool', label: 'Previous Side Panel Tool', mac: '⌘ + ⌥ + [', pc: 'Ctrl + Alt + [', category: 'app' },
   { id: 'open-settings', action: 'openSettings', label: 'Open Settings', mac: '⌘ + ,', pc: 'Ctrl + ,', category: 'app' },
+  { id: 'toggle-opacity', action: 'toggleOpacity', label: 'Toggle Window Transparency', mac: '⌘ + U', pc: 'Ctrl + Shift + U', category: 'app' },
 
   // SFTP Operations
   { id: 'sftp-copy', action: 'sftpCopy', label: 'Copy Files', mac: '⌘ + C', pc: 'Ctrl + C', category: 'sftp' },
