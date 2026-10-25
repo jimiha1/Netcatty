@@ -998,6 +998,8 @@ Highlight the focused split pane:
   'settings.shortcuts.binding.snippets': 'Open Snippets',
   'settings.shortcuts.binding.broadcast': 'Switch the Broadcast Mode',
   'settings.shortcuts.binding.toggle-side-panel': 'Toggle Side Panel',
+  'settings.shortcuts.binding.side-panel-next-tool': 'Next Side Panel Tool',
+  'settings.shortcuts.binding.side-panel-prev-tool': 'Previous Side Panel Tool',
   'settings.shortcuts.binding.toggle-host-tree': 'Toggle Host List',
   'settings.shortcuts.binding.open-settings': 'Open Settings',
   'settings.shortcuts.binding.toggle-opacity': 'Toggle Window Transparency',
