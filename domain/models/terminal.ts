@@ -143,6 +143,18 @@ export interface TerminalSettings {
 
   // SSH Connection
   verifyHostKeys: boolean; // Verify SSH host keys before authenticating
+  /**
+   * Offer the per-host legacy SSH algorithm list for connections that have
+   * no saved host (external launches and quick connect). Saved hosts ignore
+   * this and keep their own setting. Off by default.
+   */
+  temporaryConnectionsAllowLegacyAlgorithms: boolean;
+  /**
+   * Start SSH connections that have no saved host (external launches, deep
+   * links, and quick connect) in network device mode. Saved hosts and groups
+   * keep their own device type. Off by default.
+   */
+  temporaryConnectionsNetworkDeviceMode: boolean;
   keepaliveInterval: number; // Seconds between SSH-level keepalive packets (0 = disabled)
   keepaliveCountMax: number; // Unanswered keepalives before declaring the connection dead
   sshAutoReconnectEnabled: boolean; // Automatically reconnect SSH sessions after unexpected disconnects
@@ -478,6 +490,10 @@ export const normalizeTerminalSettings = (
 
   return {
     ...mergedSettings,
+    temporaryConnectionsAllowLegacyAlgorithms:
+      mergedSettings.temporaryConnectionsAllowLegacyAlgorithms === true,
+    temporaryConnectionsNetworkDeviceMode:
+      mergedSettings.temporaryConnectionsNetworkDeviceMode === true,
     rendererType,
     autocompleteMaxSuggestions,
     multilinePasteConfirmMinLines: normalizeMultilinePasteConfirmMinLines(
@@ -518,6 +534,16 @@ export const DEFAULT_TERMINAL_SCROLLBACK = 3000;
 export const HOST_INFO_BAR_HEIGHT_MIN = 22;
 export const HOST_INFO_BAR_HEIGHT_MAX = 44;
 export const HOST_INFO_BAR_HEIGHT_DEFAULT = 28;
+/** Backslash-escaped Shift+Enter text for a fresh install (legacy Alt+Enter). */
+export const DEFAULT_SHIFT_ENTER_NEWLINE_TEXT = '\\e\\r';
+
+/**
+ * Stored forms of the pre-#3770 Shift+Enter default. `\\n` is the escaped
+ * setting string; `\n` is a raw newline if one was ever persisted.
+ */
+export function isLegacyDefaultShiftEnterNewlineText(value: unknown): boolean {
+  return value === '\\n' || value === '\n';
+}
 
 const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   scrollback: DEFAULT_TERMINAL_SCROLLBACK,
@@ -538,7 +564,7 @@ const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   altAsMeta: false,
   optionArrowWordJump: false,
   shiftEnterNewlineEnabled: true,
-  shiftEnterNewlineText: '\\n',
+  shiftEnterNewlineText: DEFAULT_SHIFT_ENTER_NEWLINE_TEXT,
   shiftEnterForceText: false,
   kittyKeyboardProtocolEnabled: false,
   scrollOnInput: true,
@@ -573,6 +599,8 @@ const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   // reply to keepalive@openssh.com (older routers/switches) should set their
   // own per-host keepaliveOverride and dial these values down.
   verifyHostKeys: true,
+  temporaryConnectionsAllowLegacyAlgorithms: false,
+  temporaryConnectionsNetworkDeviceMode: false,
   keepaliveInterval: 30,
   keepaliveCountMax: 10,
   // On by default: unexpected transport drops (VPN / Wi-Fi blips) schedule an

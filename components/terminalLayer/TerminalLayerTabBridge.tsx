@@ -549,6 +549,8 @@ export function TerminalLayerTabBridge({ stableRef }: { stableRef: StableRef }) 
     restoreTerminalCwd: s.restoreTerminalCwd,
     identities: s.identities,
     isBroadcastEnabled: s.isBroadcastEnabled,
+    isComposeSendToAll: s.isComposeSendToAll,
+    onToggleComposeSendTarget: s.onToggleComposeSendTarget,
     isComposeBarOpen: s.isComposeBarOpen,
     isFocusMode,
     isSidePanelOpenForCurrentTab,
@@ -661,6 +663,8 @@ export function TerminalLayerTabBridge({ stableRef }: { stableRef: StableRef }) 
     workspaceBroadcastHandlersRef: s.workspaceBroadcastHandlersRef,
     workspaceById,
     isGlobalBroadcastEnabled: s.isGlobalBroadcastEnabled,
+    isGlobalComposeSendToAll: s.isGlobalComposeSendToAll,
+    onToggleGlobalComposeSendTarget: s.onToggleGlobalComposeSendTarget,
     canUseGlobalBroadcast: s.canUseGlobalBroadcast,
     onToggleGlobalBroadcast: s.onToggleGlobalBroadcastRef.current,
     // AI scope maintenance (merge/dissolve handoff) needs the full list; do not

@@ -275,6 +275,7 @@ export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
   { id: 'toggle-side-panel', action: 'toggleSidePanel', label: 'Toggle Side Panel', mac: '⌘ + \\', pc: 'Ctrl + \\', category: 'app' },
   { id: 'side-panel-next-tool', action: 'sidePanelNextTool', label: 'Next Side Panel Tool', mac: '⌘ + ⌥ + ]', pc: 'Ctrl + Alt + ]', category: 'app' },
   { id: 'side-panel-prev-tool', action: 'sidePanelPrevTool', label: 'Previous Side Panel Tool', mac: '⌘ + ⌥ + [', pc: 'Ctrl + Alt + [', category: 'app' },
+  { id: 'toggle-host-tree', action: 'toggleHostTree', label: 'Toggle Host List', mac: '⌘ + Shift + B', pc: 'Ctrl + Shift + B', category: 'app' },
   { id: 'open-settings', action: 'openSettings', label: 'Open Settings', mac: '⌘ + ,', pc: 'Ctrl + ,', category: 'app' },
   { id: 'toggle-opacity', action: 'toggleOpacity', label: 'Toggle Window Transparency', mac: '⌘ + U', pc: 'Ctrl + Shift + U', category: 'app' },
 
