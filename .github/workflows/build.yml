@@ -739,7 +739,7 @@ jobs:
           # NodeSource no longer serves bullseye (post-LTS): apt silently fell
           # back to Debian's nodejs 12, which ships no npm. Install the official
           # Node 22 linux-arm64 tarball instead (same approach as linux-x64).
-          NODE_VERSION="$(curl -fsSL --retry 4 --retry-connrefused --connect-timeout 20 --max-time 300 \
+          NODE_VERSION="$(curl -fsSL --retry 4 --retry-all-errors --connect-timeout 20 --max-time 300 \
             https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt \
             | awk '/node-v[0-9.]+-linux-arm64\.tar\.xz$/{print $2; exit}' \
             | sed -E 's/^node-(v[0-9.]+)-linux-arm64\.tar\.xz$/\1/')"
@@ -748,7 +748,7 @@ jobs:
             exit 1
           fi
           echo "Installing Node ${NODE_VERSION} from nodejs.org"
-          curl -fsSL --retry 4 --retry-connrefused --connect-timeout 20 --max-time 300 \
+          curl -fsSL --retry 4 --retry-all-errors --connect-timeout 20 --max-time 300 \
             "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-arm64.tar.xz" \
             | tar -xJ -C /usr/local --strip-components=1
           node -v
